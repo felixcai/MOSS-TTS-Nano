@@ -527,6 +527,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         text: str,
         prompt_audio_codes: list[list[int]],
         streaming: bool,
+        is_first_streaming_chunk: bool = True,
     ) -> dict[str, Any]:
         text_token_ids = self.encode_text(text)
         request_rows = self.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
@@ -546,8 +547,19 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         first_audio_emitted_at_perf: float | None = None
         self.codec_streaming_session.reset()
 
+        chunk_t0 = time.perf_counter()
+        last_end = chunk_t0
+        rtf_pending_lead_gen_s = 0.0
+        rtf_first_gen_s: float | None = None
+        rtf_first_audio_s: float | None = None
+        rtf_steady_gen_s_sum = 0.0
+        rtf_steady_audio_s_sum = 0.0
+        rtf_audio_chunk_count = 0
+
         def decode_pending_frames(force: bool) -> None:
             nonlocal emitted_samples_total, first_audio_emitted_at_perf
+            nonlocal last_end, rtf_pending_lead_gen_s, rtf_first_gen_s, rtf_first_audio_s
+            nonlocal rtf_steady_gen_s_sum, rtf_steady_audio_s_sum, rtf_audio_chunk_count
             pending_count = len(pending_decode_frames)
             if pending_count <= 0:
                 return
@@ -568,10 +580,35 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             audio, audio_length = decoded
             if audio_length <= 0:
                 return
+            now = time.perf_counter()
+            gen_time_s = now - last_end
+            waveform = _merge_audio_channels([audio[0, channel_index, :audio_length] for channel_index in range(audio.shape[1])])
+            event_duration_seconds = (
+                float(waveform.shape[0]) / float(sample_rate) if waveform.ndim >= 1 and sample_rate > 0 else 0.0
+            )
             if first_audio_emitted_at_perf is None:
-                first_audio_emitted_at_perf = time.perf_counter()
+                first_audio_emitted_at_perf = now
             emitted_samples_total += audio_length
-            emitted_chunks.append(_merge_audio_channels([audio[0, channel_index, :audio_length] for channel_index in range(audio.shape[1])]))
+            emitted_chunks.append(waveform)
+
+            if is_first_streaming_chunk:
+                if event_duration_seconds > 1e-9:
+                    rtf_audio_chunk_count += 1
+                    if rtf_first_gen_s is None:
+                        rtf_first_gen_s = rtf_pending_lead_gen_s + gen_time_s
+                        rtf_first_audio_s = event_duration_seconds
+                        rtf_pending_lead_gen_s = 0.0
+                    else:
+                        rtf_steady_gen_s_sum += gen_time_s
+                        rtf_steady_audio_s_sum += event_duration_seconds
+                elif rtf_first_gen_s is None:
+                    rtf_pending_lead_gen_s += gen_time_s
+            else:
+                if event_duration_seconds > 1e-9:
+                    rtf_audio_chunk_count += 1
+                    rtf_steady_gen_s_sum += gen_time_s
+                    rtf_steady_audio_s_sum += event_duration_seconds
+            last_end = now
 
         def on_frame(_generated_frames: list[list[int]], _step_index: int, frame: list[int]) -> None:
             pending_decode_frames.append(list(frame))
@@ -583,11 +620,29 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         finally:
             self.codec_streaming_session.reset()
         waveform = _concat_waveforms(emitted_chunks)
+        first_audio_latency_s = (
+            max(0.0, first_audio_emitted_at_perf - chunk_t0) if first_audio_emitted_at_perf is not None else None
+        )
+        rtf_first = (
+            rtf_first_gen_s / rtf_first_audio_s
+            if rtf_first_gen_s is not None
+            and rtf_first_audio_s is not None
+            and rtf_first_audio_s > 1e-9
+            else None
+        )
+        stream_metrics: dict[str, Any] = {
+            "audio_chunk_count": rtf_audio_chunk_count,
+            "first_audio_latency_s": first_audio_latency_s,
+            "rtf_first": rtf_first,
+            "steady_gen_s_sum": rtf_steady_gen_s_sum,
+            "steady_audio_s_sum": rtf_steady_audio_s_sum,
+        }
         return {
             "text": text,
             "text_token_ids": text_token_ids,
             "generated_frames": generated_frames,
             "waveform": waveform,
+            "stream_metrics": stream_metrics,
         }
 
     def synthesize(
@@ -606,6 +661,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         enable_normalize_tts_text: bool = True,
         seed: int | None = None,
     ) -> dict[str, Any]:
+        t_start = time.perf_counter()
         if max_new_frames is not None:
             self.manifest["generation_defaults"]["max_new_frames"] = int(max_new_frames)
         normalized_sample_mode = _normalize_sample_mode(sample_mode, do_sample)
@@ -622,20 +678,38 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         prepared_text = str(prepared_texts["text"])
         prompt_audio_codes = self.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
         text_chunks = self.split_voice_clone_text(prepared_text, max_tokens=int(voice_clone_max_text_tokens))
+        t_before_first_chunk = time.perf_counter()
         all_waveforms: list[np.ndarray] = []
         all_generated_frames: list[list[int]] = []
         sample_rate = int(self.codec_meta["codec_config"]["sample_rate"])
         channels = int(self.codec_meta["codec_config"]["channels"])
         chunk_results: list[dict[str, Any]] = []
+        streaming_flag = bool(streaming)
+        merged_stream_audio_chunks = 0
+        merged_steady_gen_s = 0.0
+        merged_steady_audio_s = 0.0
+        merged_rtf_first: float | None = None
+        merged_first_audio_latency_s: float | None = None
         for chunk_index, chunk_text in enumerate(text_chunks):
             chunk_result = self.synthesize_single_chunk(
                 text=chunk_text,
                 prompt_audio_codes=prompt_audio_codes,
-                streaming=bool(streaming),
+                streaming=streaming_flag,
+                is_first_streaming_chunk=(chunk_index == 0),
             )
             chunk_results.append(chunk_result)
             all_waveforms.append(np.asarray(chunk_result["waveform"], dtype=np.float32))
             all_generated_frames.extend(chunk_result["generated_frames"])
+            sm = chunk_result.get("stream_metrics")
+            if streaming_flag and isinstance(sm, dict):
+                merged_stream_audio_chunks += int(sm.get("audio_chunk_count", 0))
+                merged_steady_gen_s += float(sm.get("steady_gen_s_sum", 0.0))
+                merged_steady_audio_s += float(sm.get("steady_audio_s_sum", 0.0))
+                if chunk_index == 0:
+                    merged_rtf_first = sm.get("rtf_first")
+                    local_lat = sm.get("first_audio_latency_s")
+                    if local_lat is not None:
+                        merged_first_audio_latency_s = max(0.0, (t_before_first_chunk - t_start) + float(local_lat))
             if chunk_index < len(text_chunks) - 1:
                 pause_seconds = self.estimate_voice_clone_inter_chunk_pause_seconds(chunk_text)
                 pause_samples = max(0, int(round(sample_rate * pause_seconds)))
@@ -648,6 +722,31 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             else (self.output_dir / DEFAULT_BROWSER_ONNX_OUTPUT_PATH.name).resolve()
         )
         audio_path = _write_waveform_to_wav(resolved_output_audio_path, waveform, sample_rate)
+        elapsed_seconds = time.perf_counter() - t_start
+        waveform_1d_samples = int(waveform.shape[0]) if waveform.ndim >= 1 else 0
+        total_audio_s = waveform_1d_samples / float(sample_rate) if sample_rate > 0 else 0.0
+        if streaming_flag:
+            rtf_steady = merged_steady_gen_s / merged_steady_audio_s if merged_steady_audio_s > 1e-9 else None
+            rtf_metrics: dict[str, Any] = {
+                "streaming": True,
+                "audio_chunks": merged_stream_audio_chunks,
+                "total_audio_s": total_audio_s,
+                "first_audio_latency_s": merged_first_audio_latency_s,
+                "rtf_first": merged_rtf_first,
+                "rtf_steady": rtf_steady,
+                "elapsed_seconds": elapsed_seconds,
+            }
+        else:
+            gen_rtf_first = elapsed_seconds / total_audio_s if total_audio_s > 1e-9 else None
+            rtf_metrics = {
+                "streaming": False,
+                "audio_chunks": 1,
+                "total_audio_s": total_audio_s,
+                "first_audio_latency_s": elapsed_seconds,
+                "rtf_first": gen_rtf_first,
+                "rtf_steady": None,
+                "elapsed_seconds": elapsed_seconds,
+            }
         return {
             "audio_path": str(audio_path),
             "waveform": waveform,
@@ -657,6 +756,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "prepared_texts": prepared_texts,
             "sample_mode": normalized_sample_mode,
             "do_sample": normalized_sample_mode != SAMPLE_MODE_GREEDY,
-            "streaming": bool(streaming),
+            "streaming": streaming_flag,
             "chunk_results": chunk_results,
+            "rtf_metrics": rtf_metrics,
         }

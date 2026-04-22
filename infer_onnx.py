@@ -196,6 +196,29 @@ def main(argv: Optional[Sequence[str]] = None) -> dict[str, object]:
         enable_normalize_tts_text=enable_normalize_tts_text,
         seed=args.seed,
     )
+    metrics = result.get("rtf_metrics") or {}
+    if metrics.get("streaming"):
+        logging.info(
+            "Nano-TTS infer_onnx stream RTF | audio_chunks=%d | total_audio_s=%.3f | "
+            "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
+            int(metrics.get("audio_chunks", 0)),
+            float(metrics.get("total_audio_s", 0.0)),
+            f"{float(metrics['first_audio_latency_s']):.4f}"
+            if metrics.get("first_audio_latency_s") is not None
+            else "n/a",
+            f"{float(metrics['rtf_first']):.4f}" if metrics.get("rtf_first") is not None else "n/a",
+            f"{float(metrics['rtf_steady']):.4f}" if metrics.get("rtf_steady") is not None else "n/a",
+        )
+    else:
+        logging.info(
+            "Nano-TTS infer_onnx generate RTF | audio_chunks=1 | total_audio_s=%.3f | "
+            "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=n/a",
+            float(metrics.get("total_audio_s", 0.0)),
+            f"{float(metrics['first_audio_latency_s']):.4f}"
+            if metrics.get("first_audio_latency_s") is not None
+            else "n/a",
+            f"{float(metrics['rtf_first']):.4f}" if metrics.get("rtf_first") is not None else "n/a",
+        )
     logging.info(
         "saved generated audio to %s sample_rate=%s frames=%s sample_mode=%s streaming=%s",
         result["audio_path"],
