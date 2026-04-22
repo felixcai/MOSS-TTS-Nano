@@ -2856,6 +2856,22 @@ def _build_app(
             result["prompt_audio_display_path"] = prompt_audio_display_path
             if resolved_cpu_threads is not None:
                 result["cpu_threads"] = resolved_cpu_threads
+
+            waveform_numpy_gen = np.asarray(result["waveform_numpy"])
+            sample_rate_gen = int(result["sample_rate"])
+            sample_count_gen = int(waveform_numpy_gen.shape[0]) if waveform_numpy_gen.ndim >= 1 else 0
+            total_audio_s_gen = sample_count_gen / sample_rate_gen if sample_rate_gen > 0 else 0.0
+            elapsed_s_gen = float(result["elapsed_seconds"])
+            gen_rtf_first = elapsed_s_gen / total_audio_s_gen if total_audio_s_gen > 1e-9 else None
+            logging.info(
+                "Nano-TTS generate RTF | audio_chunks=1 | total_audio_s=%.3f | "
+                "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
+                total_audio_s_gen,
+                f"{elapsed_s_gen:.4f}",
+                f"{gen_rtf_first:.4f}" if gen_rtf_first is not None else "n/a",
+                "n/a",
+            )
+
             text_chunks = [
                 str(chunk).strip()
                 for chunk in (result.get("voice_clone_text_chunks") or [])
