@@ -2333,73 +2333,130 @@ def _build_app(
                     seed=seed,
                 )
 
+            # Stream RTF: wall time between iterator yields vs audio duration per chunk.
+            # First emitted chunk with positive duration uses accumulated lead gen time (empty / zero-duration yields).
+            last_end = time.monotonic()
+            rtf_pending_lead_gen_s = 0.0
+            rtf_first_gen_s: float | None = None
+            rtf_first_audio_s: float | None = None
+            rtf_steady_gen_s_sum = 0.0
+            rtf_steady_audio_s_sum = 0.0
+            rtf_audio_chunk_count = 0
+
             for event, resolved_execution_device, resolved_cpu_threads in runtime_manager.iter_with_runtime(
                 requested_execution_device="cuda",
                 cpu_threads=cpu_threads,
                 factory=_stream_factory,
             ):
-                event_type = str(event.get("type", ""))
-                with job.lock:
-                    if job.is_closed:
-                        break
+                t_receive = time.monotonic()
+                gen_time_s = t_receive - last_end
+                try:
+                    event_type = str(event.get("type", ""))
+                    with job.lock:
+                        if job.is_closed:
+                            break
 
-                if event_type == "audio":
-                    waveform_numpy = np.asarray(event["waveform_numpy"], dtype=np.float32)
-                    pcm_bytes = _audio_to_pcm16le_bytes(waveform_numpy)
-                    if not pcm_bytes:
+                    if event_type == "audio":
+                        waveform_numpy = np.asarray(event["waveform_numpy"], dtype=np.float32)
+                        pcm_bytes = _audio_to_pcm16le_bytes(waveform_numpy)
+                        sample_rate = int(event["sample_rate"])
+                        channels = 1 if waveform_numpy.ndim == 1 else int(waveform_numpy.shape[1])
+                        is_pause = bool(event.get("is_pause", False))
+                        event_duration_seconds = (
+                            float(waveform_numpy.shape[0]) / float(sample_rate)
+                            if sample_rate > 0 and waveform_numpy.ndim >= 1
+                            else 0.0
+                        )
+                        if pcm_bytes and event_duration_seconds > 1e-9:
+                            if rtf_first_gen_s is None:
+                                rtf_first_gen_s = rtf_pending_lead_gen_s + gen_time_s
+                                rtf_first_audio_s = event_duration_seconds
+                                rtf_pending_lead_gen_s = 0.0
+                            else:
+                                rtf_steady_gen_s_sum += gen_time_s
+                                rtf_steady_audio_s_sum += event_duration_seconds
+                            rtf_audio_chunk_count += 1
+                        elif rtf_first_gen_s is None:
+                            rtf_pending_lead_gen_s += gen_time_s
+
+                        if not pcm_bytes:
+                            continue
+                        with job.lock:
+                            job.sample_rate = sample_rate
+                            job.channels = channels
+                            job.emitted_audio_seconds = float(event.get("emitted_audio_seconds", 0.0))
+                            job.lead_seconds = float(event.get("lead_seconds", 0.0))
+                            normalized_chunk_index, job.chunk_index_base = _normalize_stream_chunk_index(
+                                event.get("chunk_index"),
+                                chunk_count=len(job.text_chunks),
+                                current_base=job.chunk_index_base,
+                            )
+                            if normalized_chunk_index is not None:
+                                job.current_chunk_index = normalized_chunk_index
+                                if not is_pause and event_duration_seconds > 0.0:
+                                    chunk_end_seconds = job.emitted_audio_seconds
+                                    chunk_start_seconds = max(0.0, chunk_end_seconds - event_duration_seconds)
+                                    job.audio_chunk_ranges.append(
+                                        (chunk_start_seconds, chunk_end_seconds, normalized_chunk_index)
+                                    )
+                            if job.first_audio_at is None and not is_pause:
+                                job.first_audio_at = time.monotonic()
+                            job.run_status = (
+                                f"Streaming | emitted={job.emitted_audio_seconds:.2f}s | lead={job.lead_seconds:.2f}s"
+                            )
+                        _put_stream_audio(job, pcm_bytes)
                         continue
-                    sample_rate = int(event["sample_rate"])
-                    channels = 1 if waveform_numpy.ndim == 1 else int(waveform_numpy.shape[1])
-                    is_pause = bool(event.get("is_pause", False))
-                    event_duration_seconds = (
-                        float(waveform_numpy.shape[0]) / float(sample_rate)
-                        if sample_rate > 0 and waveform_numpy.ndim >= 1
-                        else 0.0
-                    )
-                    with job.lock:
-                        job.sample_rate = sample_rate
-                        job.channels = channels
-                        job.emitted_audio_seconds = float(event.get("emitted_audio_seconds", 0.0))
-                        job.lead_seconds = float(event.get("lead_seconds", 0.0))
-                        normalized_chunk_index, job.chunk_index_base = _normalize_stream_chunk_index(
-                            event.get("chunk_index"),
-                            chunk_count=len(job.text_chunks),
-                            current_base=job.chunk_index_base,
-                        )
-                        if normalized_chunk_index is not None:
-                            job.current_chunk_index = normalized_chunk_index
-                            if not is_pause and event_duration_seconds > 0.0:
-                                chunk_end_seconds = job.emitted_audio_seconds
-                                chunk_start_seconds = max(0.0, chunk_end_seconds - event_duration_seconds)
-                                job.audio_chunk_ranges.append(
-                                    (chunk_start_seconds, chunk_end_seconds, normalized_chunk_index)
-                                )
-                        if job.first_audio_at is None and not is_pause:
-                            job.first_audio_at = time.monotonic()
-                        job.run_status = (
-                            f"Streaming | emitted={job.emitted_audio_seconds:.2f}s | lead={job.lead_seconds:.2f}s"
-                        )
-                    _put_stream_audio(job, pcm_bytes)
-                    continue
 
-                if event_type == "result":
-                    formatted_result = dict(event)
-                    formatted_result["execution_device"] = resolved_execution_device
-                    formatted_result["prompt_audio_display_path"] = prompt_audio_display_path
-                    if resolved_cpu_threads is not None:
-                        formatted_result["cpu_threads"] = resolved_cpu_threads
-                    formatted_run_status = _format_run_status(formatted_result)
-                    with job.lock:
-                        job.final_result = {
-                            "audio_path": event.get("audio_path"),
-                            "prompt_audio_path": prompt_audio_display_path,
-                            "run_status": formatted_run_status,
-                            "text_chunks": list(job.text_chunks),
-                        }
-                        job.prompt_audio_path = prompt_audio_display_path
-                        job.state = "done"
-                        job.completed_at = time.monotonic()
-                        job.run_status = formatted_run_status
+                    if event_type == "result":
+                        formatted_result = dict(event)
+                        formatted_result["execution_device"] = resolved_execution_device
+                        formatted_result["prompt_audio_display_path"] = prompt_audio_display_path
+                        if resolved_cpu_threads is not None:
+                            formatted_result["cpu_threads"] = resolved_cpu_threads
+                        formatted_run_status = _format_run_status(formatted_result)
+                        with job.lock:
+                            job.final_result = {
+                                "audio_path": event.get("audio_path"),
+                                "prompt_audio_path": prompt_audio_display_path,
+                                "run_status": formatted_run_status,
+                                "text_chunks": list(job.text_chunks),
+                            }
+                            job.prompt_audio_path = prompt_audio_display_path
+                            job.state = "done"
+                            job.completed_at = time.monotonic()
+                            job.run_status = formatted_run_status
+
+                        total_audio_s = (rtf_first_audio_s or 0.0) + rtf_steady_audio_s_sum
+                        rtf_first = (
+                            rtf_first_gen_s / rtf_first_audio_s
+                            if rtf_first_gen_s is not None
+                            and rtf_first_audio_s is not None
+                            and rtf_first_audio_s > 1e-9
+                            else None
+                        )
+                        rtf_steady = (
+                            rtf_steady_gen_s_sum / rtf_steady_audio_s_sum
+                            if rtf_steady_audio_s_sum > 1e-9
+                            else None
+                        )
+                        with job.lock:
+                            first_audio_latency_s = (
+                                None
+                                if job.started_at is None or job.first_audio_at is None
+                                else max(0.0, job.first_audio_at - job.started_at)
+                            )
+                        logging.info(
+                            "Nano-TTS stream RTF | stream_id=%s | audio_chunks=%d | total_audio_s=%.3f | "
+                            "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
+                            job.stream_id,
+                            rtf_audio_chunk_count,
+                            total_audio_s,
+                            f"{first_audio_latency_s:.4f}" if first_audio_latency_s is not None else "n/a",
+                            f"{rtf_first:.4f}" if rtf_first is not None else "n/a",
+                            f"{rtf_steady:.4f}" if rtf_steady is not None else "n/a",
+                        )
+                finally:
+                    last_end = time.monotonic()
         except Exception as exc:
             logging.exception("Nano-TTS realtime streaming job failed")
             with job.lock:
@@ -2799,6 +2856,22 @@ def _build_app(
             result["prompt_audio_display_path"] = prompt_audio_display_path
             if resolved_cpu_threads is not None:
                 result["cpu_threads"] = resolved_cpu_threads
+
+            waveform_numpy_gen = np.asarray(result["waveform_numpy"])
+            sample_rate_gen = int(result["sample_rate"])
+            sample_count_gen = int(waveform_numpy_gen.shape[0]) if waveform_numpy_gen.ndim >= 1 else 0
+            total_audio_s_gen = sample_count_gen / sample_rate_gen if sample_rate_gen > 0 else 0.0
+            elapsed_s_gen = float(result["elapsed_seconds"])
+            gen_rtf_first = elapsed_s_gen / total_audio_s_gen if total_audio_s_gen > 1e-9 else None
+            logging.info(
+                "Nano-TTS generate RTF | audio_chunks=1 | total_audio_s=%.3f | "
+                "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
+                total_audio_s_gen,
+                f"{elapsed_s_gen:.4f}",
+                f"{gen_rtf_first:.4f}" if gen_rtf_first is not None else "n/a",
+                "n/a",
+            )
+
             text_chunks = [
                 str(chunk).strip()
                 for chunk in (result.get("voice_clone_text_chunks") or [])

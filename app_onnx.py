@@ -629,6 +629,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.share:
         logging.warning("--share is ignored by the FastAPI-based ONNX app.")
 
+    # Stream and buffered /generate use legacy_app._build_app (app.py), which logs
+    # "Nano-TTS stream RTF" and "Nano-TTS generate RTF" with first_audio latency (TTFB-style) and RTF.
     app = legacy_app._build_app(runtime, warmup_manager, text_normalizer_manager, root_path)
     app.title = "MOSS-TTS-Nano ONNX Demo"
     uvicorn.run(
