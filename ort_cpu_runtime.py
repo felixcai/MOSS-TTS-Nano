@@ -346,10 +346,12 @@ class OrtCpuRuntime:
 
     def _session(self, path_value: Path) -> ort.InferenceSession:
         options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         options.intra_op_num_threads = self.thread_count
         options.inter_op_num_threads = 1
-        return ort.InferenceSession(str(path_value), sess_options=options, providers=["CPUExecutionProvider"])
+        # return ort.InferenceSession(str(path_value), sess_options=options, providers=["CPUExecutionProvider"])
+        return ort.InferenceSession(str(path_value), sess_options=options, providers=["CUDAExecutionProvider"])
 
     def _create_sessions(self) -> dict[str, ort.InferenceSession]:
         tts_dir = self.tts_meta_path.parent
