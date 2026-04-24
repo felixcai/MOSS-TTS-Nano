@@ -10,9 +10,13 @@
 
 以下两点与上述阶梯式上涨较为吻合，且分别对应「模型多份常驻」与「流式提前断开时的线程/队列行为」。
 
+**代码状态**：仓库中已对第 1、2 点做针对性修复（单一默认 runtime、流式 worker 取消与队列 drain）；细节与变更清单见同目录 [`task.md`](task.md)。下文仍保留原始问题分析，便于对照历史现象。
+
 ---
 
 ## 1. `cpu_threads` 缓存导致 ONNX 运行时多份加载（5.8G → 12G 量级）
+
+> **已修复**：`OnnxRequestRuntimeManager._build_runtime_locked` 现始终复用 `default_runtime`，不再按请求线程数新建第二套 ONNX 会话；与启动 `--cpu-threads` 不一致时仅打 `WARNING`。
 
 **位置**：`app_onnx.py` 中 `OnnxRequestRuntimeManager._build_runtime_locked`（以及 `_cpu_runtimes` 字典的缓存策略）。
 
@@ -31,6 +35,8 @@
 ---
 
 ## 2. 流式路径：消费端提前结束与后台 worker + 有界队列（12G → 15G+ 的风险）
+
+> **已修复**：`synthesize_stream` 内增加 `_stop_event`、带超时的 `_safe_put`、消费端 `finally` 中 drain 队列，避免客户端断开后 worker 永久阻塞在满队 `put()` 上。
 
 **位置**：`app_onnx.py` 中 `OnnxNanoTTSServiceAdapter.synthesize_stream`：后台线程 `_worker` + `queue.Queue(maxsize=128)` + 外层 `while True: item = event_queue.get(); yield item`。
 
@@ -60,6 +66,12 @@
 - 在外层生成器收到 `GeneratorExit` 或显式关闭时，向 worker 发**取消事件**，worker 在循环中检查并尽快退出，避免无限 `put` 阻塞。
 - 或将 `put` 改为带超时的非阻塞策略，并在取消时丢弃或 drain 队列；与 `app.py` 里 `_run_streaming_job` 的 `job.is_closed` 等语义对齐更佳。
 
+### 3.1 已实现（与 `task.md` 对齐）
+
+- **Fix 1**：始终复用启动时创建的 `OnnxNanoTTSServiceAdapter`，避免按 `cpu_threads` 多份加载 ONNX。
+- **Fix 2**：流式生成器退出时置停止事件并 drain 内部 `event_queue`；worker 侧用可中断的入队逻辑，并在 chunk 边界检查停止信号。
+- **观测**：`app_onnx.py` 中 `_log_memory` 同时输出 **`proc_rss`（当前进程工作集）** 与 **`sys_used`（整机已用物理内存，psutil）**，便于与任务管理器对照。
+
 ---
 
 ## 4. 相关代码锚点（便于跳转）
@@ -73,4 +85,61 @@
 
 ---
 
-*记录日期：基于对话整理；若后续代码已修复上述点，请在本文件追加「已修复版本」说明以免误导。*
+## 5. 日志里 `proc_rss` 与 `sys_used` 为何常对不上
+
+- **`proc_rss`**：当前 Python 进程的常驻物理内存（在 Windows 上更接近 Working Set）。主要反映进程地址空间里**已被 OS 挂到该进程上的页**；C++ 扩展（ONNX Runtime）里大量**已提交、但近期未频繁访问**的页，可能不全部体现在 RSS 里。
+- **`sys_used`**：`psutil.virtual_memory().used`，**整机**已用物理内存，与任务管理器「已用内存」口径接近，包含其他进程、文件缓存、子进程等。
+
+因此会出现：**一次推理里 `proc_rss` 只涨几百 MB，而 `sys_used` 涨 2GB+**。这往往来自 ONNX/allocator 的大块提交、内存映射、子进程（如文本规范化相关进程）或其它系统缓存，并不矛盾。做容量规划时，**更应盯 `sys_used`（或任务管理器）**。
+
+---
+
+## 6. 同一次 `POST /api/generate-stream/start` 里为何 `build_runtime` 打两次日志
+
+`app.py` 在同一路由里对 `runtime_manager` 做了**两次**独立加锁取 runtime：
+
+1. **`_resolve_voice_clone_text_chunks`**：在起后台线程**之前**，`call_with_runtime` → `split_voice_clone_text`，先把全文切成 `text_chunks` 写入 `StreamingJob`（供前端分句与进度）。
+2. **后台 `_run_streaming_job`**：`iter_with_runtime` → `synthesize_stream`，真正流式合成。
+
+两次都会进入 `OnnxRequestRuntimeManager._locked_runtime` → `_build_runtime_locked`，因此日志里会出现两条相邻的 `[MEM] build_runtime...`（时间差通常只有几毫秒）。**不是泄漏或重复建会话**（修复后两次都返回同一 `default_runtime`）。
+
+---
+
+## 7. 实测日志模式：短请求重复 vs 长文本 + 换音色
+
+### 7.1 同音色、同短文本多次请求
+
+`sys_used` 每次只有**几十 MB 量级**波动：说明修复后**无宏观泄漏**；小幅上涨可能来自 GC 尚未回收、队列中尚未消费的 PCM、或 ONNX arena 的碎片。
+
+### 7.2 换音色 + 更长文本（多 chunk）
+
+常见模式：
+
+- **Chunk 0 结束**时 `sys_used` 出现**单次巨大跃升**（例如 +2GB 量级）：往往对应「本轮推理第一次触达当前配置下的**峰值工作集**」——更长上下文、更长参考音频编码后的 prompt token、以及 ONNX **Arena** 向系统一次性申请的大块内存。
+- **后续 chunk**：`sys_used` 增量明显变小甚至略降：说明引擎在**复用已申请好的内存池**，不必再向 OS 要同样量级的新页。
+- **`finally exit` 后 `sys_used` 未必回落**：ORT 等原生 allocator 常采用**高水位（high watermark）**策略，为下次请求保留池子，不立即把物理页还给操作系统；这是**性能与 RSS 报表之间的权衡**，不等于 Python 层又泄漏了一份对象图。
+
+---
+
+## 8. 这是「模型行为」吗？Python 侧能控制什么？
+
+### 8.1 模型 / 运行时侧（本质）
+
+- **参考音频（voice clone）**：换音色或换上传的 prompt，会走 codec 编码得到 `prompt_audio_codes`；更长参考音频 → **更长的前缀序列**，后续每一步 decode 都要带着这份上下文，**内存随有效序列长度上升**（具体关系由导出 ONNX 的图结构决定，常见为随长度近似线性或超线性）。
+- **自回归 TTS decode**：生成长度增加时，中间激活与（若图中有）KV 类状态会占用更多内存；长文本还会被切成多个 chunk，但**每个 chunk 内**仍可能在该 chunk 的峰值上触顶 allocator。
+
+以上主要由**导出模型 + ORT 执行计划 +  allocator** 决定，不全是 Python 里几行 list 能解释的。
+
+### 8.2 Python / 配置侧可做的优化（可操作清单）
+
+| 手段 | 说明 |
+|------|------|
+| **减小 `voice_clone_max_text_tokens`**（请求或前端表单） | 单 chunk 文本更短，降低单次 prefill/decode 的序列峰值，通常直接压低内存尖峰。 |
+| **限制参考音频时长** | 上传或 demo 的 prompt 控制在数秒级即可兼顾音色；过长 prompt 是 KV/前缀长度的主要推手之一。 |
+| **ORT SessionOptions（改 `ort_cpu_runtime.py` 的 `_session`）** | 例如 `add_session_config_entry("session.memory_arena_shrink_strategy", "cpu:0")` 鼓励 arena 在空闲时收缩；或 `enable_cpu_mem_arena = False` 换更低常驻、略损性能。需按版本文档验证键名与行为。 |
+| **合理 `cpu_threads`** | 线程本地 arena 可能放大常驻；内存紧张时可适当降低 intra-op 线程数（与启动参数一致，避免误以为请求里改线程会换会话——修复后请求侧线程数已被忽略）。 |
+| **`max_new_frames` 等生成上限** | 限制极端长语音生成的步数，避免最坏情况下的长时间自回归与中间张量堆积。 |
+
+---
+
+*记录日期：基于对话整理；第 1、2 节问题已在代码中修复，第 5–8 节为日志解读与优化备忘。更细的变更列表见 [`task.md`](task.md)。*
