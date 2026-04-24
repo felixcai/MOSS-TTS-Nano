@@ -64,11 +64,11 @@ print(ort.get_available_providers())
 
 ## 5. 常见环境问题（按现象处理）
 
-| 现象 | 处理要点 |
-|------|----------|
-| `import onnxruntime` 正常但缺属性 / 行为异常 | 检查当前工程目录下是否有同名文件夹 **`onnxruntime`** 遮蔽真包；`print(ort.__path__)` 看是否指到项目目录 |
+| 现象                                                              | 处理要点                                                                                                |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `import onnxruntime` 正常但缺属性 / 行为异常                              | 检查当前工程目录下是否有同名文件夹 **`onnxruntime`** 遮蔽真包；`print(ort.__path__)` 看是否指到项目目录                            |
 | `ort.__path__` 为 `_NamespacePath(...site-packages/onnxruntime)` | 多为 **卸载残留空壳**；需在对应 `site-packages` 下 **删除残留 `onnxruntime` 目录** 后重装 `onnxruntime-gpu`（操作在目标机器上由人工执行） |
-| 二进制与 NumPy 2.x 不兼容报错 | 将 NumPy 降到 1.x：`python -m pip install "numpy<2.0"` |
+| 二进制与 NumPy 2.x 不兼容报错                                            | 将 NumPy 降到 1.x：`python -m pip install "numpy<2.0"`                                                  |
 
 ---
 
