@@ -31,6 +31,19 @@ from ort_cpu_runtime import _resolve_stream_decode_frame_budget
 _LEGACY_RENDER_INDEX_HTML = legacy_app._render_index_html
 
 
+def _log_memory(label: str) -> None:
+    try:
+        import psutil
+        proc_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        sys_used_mb = psutil.virtual_memory().used / (1024 * 1024)
+        logging.info(
+            "[MEM] %s | proc_rss=%.1f MB | sys_used=%.1f MB",
+            label, proc_rss_mb, sys_used_mb,
+        )
+    except Exception:
+        pass
+
+
 class _CpuDeviceInfo:
     type = "cpu"
 
@@ -247,9 +260,25 @@ class OnnxNanoTTSServiceAdapter:
     ) -> Iterator[dict[str, object]]:
         del mode, tts_max_batch_size, codec_max_batch_size
         event_queue: "queue.Queue[dict[str, object] | None]" = queue.Queue(maxsize=128)
+        _stop_event = threading.Event()
+
+        def _safe_put(item: "dict[str, object] | None") -> bool:
+            """Put an item onto the event queue, respecting the stop signal.
+
+            Returns True if the item was queued, False if the stream was cancelled
+            before the item could be placed (item is silently dropped).
+            """
+            while not _stop_event.is_set():
+                try:
+                    event_queue.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
 
         def _worker() -> None:
             try:
+                _log_memory("stream_worker: start")
                 resolved_sample_mode = self._resolve_sample_mode(attn_implementation, do_sample=do_sample)
                 self._apply_generation_options(
                     sample_mode=resolved_sample_mode,
@@ -275,6 +304,8 @@ class OnnxNanoTTSServiceAdapter:
                 all_generated_frames: list[list[int]] = []
 
                 for chunk_index, chunk_text in enumerate(text_chunks):
+                    if _stop_event.is_set():
+                        break
                     text_token_ids = self.runtime.encode_text(chunk_text)
                     request_rows = self.runtime.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
                     pending_decode_frames: list[list[int]] = []
@@ -292,7 +323,7 @@ class OnnxNanoTTSServiceAdapter:
                             elapsed_since_first_audio = max(0.0, time.perf_counter() - first_audio_emitted_at_perf)
                             lead_seconds = (emitted_samples_total / float(sample_rate)) - elapsed_since_first_audio
                         emitted_chunks.append(np.asarray(waveform, dtype=np.float32))
-                        event_queue.put(
+                        _safe_put(
                             {
                                 "type": "audio",
                                 "waveform_numpy": np.asarray(waveform, dtype=np.float32),
@@ -343,6 +374,10 @@ class OnnxNanoTTSServiceAdapter:
                     chunk_waveform = _concat_waveforms(emitted_chunks)
                     all_waveforms.append(chunk_waveform)
                     all_generated_frames.extend(generated_frames)
+                    _log_memory(f"stream_worker: chunk {chunk_index} done")
+
+                    if _stop_event.is_set():
+                        break
 
                     if chunk_index < len(text_chunks) - 1:
                         pause_seconds = self.runtime.estimate_voice_clone_inter_chunk_pause_seconds(chunk_text)
@@ -352,40 +387,56 @@ class OnnxNanoTTSServiceAdapter:
                             _emit_waveform(pause_waveform, is_pause=True)
                             all_waveforms.append(pause_waveform)
 
-                waveform = _concat_waveforms(all_waveforms)
-                output_path = _write_waveform_to_wav(
-                    self.output_dir / "app_onnx_stream_output.wav",
-                    waveform,
-                    sample_rate,
-                )
-                event_queue.put(
-                    {
-                        "type": "result",
-                        **self._format_result_payload(
-                            waveform=waveform,
-                            sample_rate=sample_rate,
-                            elapsed_seconds=time.perf_counter() - start_time,
-                            audio_path=str(output_path),
-                            voice=voice,
-                            prompt_audio_path=prompt_audio_path,
-                            text_chunks=text_chunks,
-                        ),
-                    }
-                )
+                if not _stop_event.is_set():
+                    waveform = _concat_waveforms(all_waveforms)
+                    output_path = _write_waveform_to_wav(
+                        self.output_dir / "app_onnx_stream_output.wav",
+                        waveform,
+                        sample_rate,
+                    )
+                    _safe_put(
+                        {
+                            "type": "result",
+                            **self._format_result_payload(
+                                waveform=waveform,
+                                sample_rate=sample_rate,
+                                elapsed_seconds=time.perf_counter() - start_time,
+                                audio_path=str(output_path),
+                                voice=voice,
+                                prompt_audio_path=prompt_audio_path,
+                                text_chunks=text_chunks,
+                            ),
+                        }
+                    )
             except Exception as exc:
-                event_queue.put({"type": "error", "error": str(exc)})
+                _safe_put({"type": "error", "error": str(exc)})
             finally:
-                event_queue.put(None)
+                _log_memory("stream_worker: finally exit")
+                # Always place the sentinel; if the consumer is gone, _safe_put
+                # will drop the None silently, which is fine — the generator's
+                # finally block has already drained the queue.
+                _safe_put(None)
 
         worker = threading.Thread(target=_worker, name="onnx-synthesize-stream", daemon=True)
         worker.start()
-        while True:
-            item = event_queue.get()
-            if item is None:
-                break
-            if str(item.get("type")) == "error":
-                raise RuntimeError(str(item.get("error") or "Unknown ONNX streaming error"))
-            yield item
+        try:
+            while True:
+                item = event_queue.get()
+                if item is None:
+                    break
+                if str(item.get("type")) == "error":
+                    raise RuntimeError(str(item.get("error") or "Unknown ONNX streaming error"))
+                yield item
+        finally:
+            # Signal the worker to stop producing (handles client disconnects /
+            # GeneratorExit) and drain any items already in the queue so the
+            # worker can unblock from a full-queue put() within ~0.5 s.
+            _stop_event.set()
+            while True:
+                try:
+                    event_queue.get_nowait()
+                except queue.Empty:
+                    break
 
 
 class OnnxRequestRuntimeManager:
@@ -426,18 +477,15 @@ class OnnxRequestRuntimeManager:
         return max(1, normalized_threads)
 
     def _build_runtime_locked(self, cpu_threads: int) -> OnnxNanoTTSServiceAdapter:
-        runtime = self._cpu_runtimes.get(cpu_threads)
-        if runtime is not None:
-            return runtime
-        runtime = OnnxNanoTTSServiceAdapter(
-            model_dir=self._factory_model_dir or self.default_runtime.model_dir,
-            output_dir=self._factory_output_dir or self.default_runtime.output_dir,
-            cpu_threads=cpu_threads,
-            max_new_frames=self._factory_max_new_frames,
-            text_normalizer_manager=self._factory_text_normalizer_manager,
-        )
-        self._cpu_runtimes[cpu_threads] = runtime
-        return runtime
+        _log_memory(f"build_runtime: cpu_threads={cpu_threads}")
+        if cpu_threads != self.default_runtime.thread_count:
+            logging.warning(
+                "OnnxRequestRuntimeManager: ignoring cpu_threads=%d (default=%d) "
+                "to avoid loading a second ONNX session; reusing default runtime.",
+                cpu_threads,
+                self.default_runtime.thread_count,
+            )
+        return self.default_runtime
 
     def resolve_runtime(self, requested: str | None) -> tuple[OnnxNanoTTSServiceAdapter, str]:
         del requested
@@ -613,8 +661,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_new_frames=args.max_new_frames,
         text_normalizer_manager=text_normalizer_manager,
     )
+    _log_memory("main: runtime created")
     warmup_manager = legacy_app.WarmupManager(runtime, text_normalizer_manager=text_normalizer_manager)
     warmup_manager.start()
+    _log_memory("main: warmup started (port not open yet)")
 
     OnnxRequestRuntimeManager._factory_model_dir = runtime.model_dir
     OnnxRequestRuntimeManager._factory_output_dir = output_dir
