@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+# =============================================================================
+# ort_cpu_runtime.py — ONNX 核心推理层（调用链最底层）
+#
+# 在 Stream Generate 调用链中的角色：
+#   app.py → app_onnx.py → onnx_tts_runtime.py → [本文件 OrtCpuRuntime]
+#                                               ↑               ↓
+#                              app_onnx.py._on_frame ← on_frame 回调
+#                                    ↓
+#                          CodecStreamingDecodeSession.run_frames（本文件）
+#
+# 对外暴露的核心接口（被其他文件调用）：
+#   - OrtCpuRuntime.__init__ / generate_audio_frames / build_voice_clone_request_rows
+#   - CodecStreamingDecodeSession.run_frames / reset
+#   - _normalize_sample_mode / _resolve_stream_decode_frame_budget
+# =============================================================================
+
 import json
 import math
 import time
@@ -25,10 +41,17 @@ MODEL_DIR_ALIAS_MAP = {
 }
 
 
+# -----------------------------------------------------------------------------
+# 模块级辅助函数 —— 均为 [调用链内部] 纯计算工具函数，由本文件内部调用
+# -----------------------------------------------------------------------------
+
+# [调用链内部] 被 _sample_from_scores 调用（do_sample=False 时取 argmax 作为 greedy 解码）
 def _argmax(values: np.ndarray) -> int:
     return int(np.argmax(values))
 
 
+# [调用链内部] 被 generate_audio_frames / decode_full_audio / warmup 调用
+# 将 3D 嵌套 list 展平为 1D int32 数组，同时返回原始维度，供 ONNX session.run 构造输入张量
 def _flatten3d_int32(nested: list[list[list[int]]]) -> tuple[np.ndarray, list[int]]:
     dim0 = len(nested)
     dim1 = len(nested[0])
@@ -43,6 +66,8 @@ def _flatten3d_int32(nested: list[list[list[int]]]) -> tuple[np.ndarray, list[in
     return data, [dim0, dim1, dim2]
 
 
+# [调用链内部] 被 generate_audio_frames / warmup 调用
+# 将 2D 嵌套 list 展平为 1D int32 数组，供构造 attention_mask 张量
 def _flatten2d_int32(nested: list[list[int]]) -> tuple[np.ndarray, list[int]]:
     dim0 = len(nested)
     dim1 = len(nested[0])
@@ -55,6 +80,8 @@ def _flatten2d_int32(nested: list[list[int]]) -> tuple[np.ndarray, list[int]]:
     return data, [dim0, dim1]
 
 
+# [调用链内部] 被 decode_full_audio 调用（非流式路径）
+# codec decode 输出张量形状为 (1, channels, samples)，按声道切片并截断到有效长度
 def _slice_channel_major_audio(audio: np.ndarray, start_sample: int = 0, end_sample: int | None = None) -> list[np.ndarray]:
     if audio.ndim != 3 or audio.shape[0] != 1:
         raise ValueError(f"Unexpected audio tensor shape: {audio.shape}")
@@ -65,6 +92,9 @@ def _slice_channel_major_audio(audio: np.ndarray, start_sample: int = 0, end_sam
     return [audio[0, channel_index, start:end].astype(np.float32, copy=False) for channel_index in range(channels)]
 
 
+# [调用链内部] 被 generate_audio_frames / warmup 调用
+# prefill/decode 模型输出 global_hidden 可能是 (seq_len, hidden) 或 (1, seq_len, hidden)
+# 统一取最后一个时间步作为当前帧的全局隐状态
 def _extract_last_hidden(hidden_states: np.ndarray) -> np.ndarray:
     if hidden_states.ndim == 2:
         return hidden_states.astype(np.float32, copy=False)
@@ -73,6 +103,8 @@ def _extract_last_hidden(hidden_states: np.ndarray) -> np.ndarray:
     return hidden_states[:, -1, :].astype(np.float32, copy=False)
 
 
+# [调用链内部] 被 _sample_audio_token 调用
+# 对已生成 token 施加重复惩罚：score < 0 时乘以 penalty（使更负），score > 0 时除以 penalty（使更小）
 def _apply_repetition_penalty(values: np.ndarray, previous_token_ids: list[int], repetition_penalty: float) -> np.ndarray:
     if not previous_token_ids or repetition_penalty == 1.0:
         return values
@@ -84,6 +116,7 @@ def _apply_repetition_penalty(values: np.ndarray, previous_token_ids: list[int],
     return result
 
 
+# [调用链内部] 被 _sample_audio_token 调用（do_sample=False 时的带重复惩罚 greedy 解码）
 def _argmax_with_repetition_penalty(values: np.ndarray, previous_token_set: set[int], repetition_penalty: float) -> int:
     best_index = 0
     best_value = float("-inf")
@@ -98,6 +131,7 @@ def _argmax_with_repetition_penalty(values: np.ndarray, previous_token_set: set[
     return int(best_index)
 
 
+# [调用链内部] 被 _sample_from_scores 调用，数值稳定的 softmax（先减最大值再 exp）
 def _softmax(values: np.ndarray) -> np.ndarray:
     max_value = float(np.max(values))
     shifted = np.asarray(values - max_value, dtype=np.float64)
@@ -105,6 +139,8 @@ def _softmax(values: np.ndarray) -> np.ndarray:
     return exps / np.sum(exps, dtype=np.float64)
 
 
+# [调用链内部] 被 _sample_assistant_text_token / _sample_audio_token 调用
+# 实现 top-k + top-p 采样：先 top-k 截断，再 top-p 核采样，最后按概率分布随机采样
 def _sample_from_scores(
     values: np.ndarray,
     *,
@@ -150,6 +186,9 @@ def _sample_from_scores(
     return _argmax(scores)
 
 
+# [调用链内部] 被 generate_audio_frames（local_cached_step 分支）调用
+# 采样 assistant 文本 token：只在 audio_assistant_slot_token_id 和 audio_end_token_id 两个候选中选择
+# 若采样结果为 audio_end_token_id，则 generate_audio_frames 会终止生成循环
 def _sample_assistant_text_token(
     text_logits: np.ndarray,
     manifest: dict[str, Any],
@@ -175,6 +214,8 @@ def _sample_assistant_text_token(
     return int(candidate_ids[sampled_index])
 
 
+# [调用链内部] 被 generate_audio_frames 调用，对单个 VQ 声道进行采样
+# 先施加重复惩罚（抑制已出现的 token），再通过 top-k/top-p 采样
 def _sample_audio_token(
     audio_logits: np.ndarray,
     previous_token_ids: list[int],
@@ -196,6 +237,9 @@ def _sample_audio_token(
     )
 
 
+# [调用链入口] 被 OrtCpuRuntime.__init__ 调用，也被 onnx_tts_runtime.py 等上层按需调用
+# 将外部传入的 sample_mode 字符串规范化为三种模式之一（greedy / fixed / full）
+# "mixed3" 是旧别名：do_sample=True 时等价于 fixed，否则等价于 greedy
 def _normalize_sample_mode(raw_sample_mode: str | None, raw_do_sample: bool = True) -> str:
     normalized = str(raw_sample_mode or "").strip()
     if normalized in {SAMPLE_MODE_GREEDY, SAMPLE_MODE_FIXED, SAMPLE_MODE_FULL}:
@@ -205,6 +249,8 @@ def _normalize_sample_mode(raw_sample_mode: str | None, raw_do_sample: bool = Tr
     return SAMPLE_MODE_GREEDY if not raw_do_sample else SAMPLE_MODE_FIXED
 
 
+# [调用链内部] 被 _resolve_stream_decode_frame_budget 调用
+# 计算已生成音频比实时播放"超前"的秒数（lead_seconds > 0 表示缓冲充足）
 def _compute_stream_lead_seconds(emitted_samples_total: int, sample_rate: int, first_audio_emitted_at_seconds: float | None) -> float:
     if not first_audio_emitted_at_seconds or sample_rate <= 0:
         return 0.0
@@ -213,6 +259,10 @@ def _compute_stream_lead_seconds(emitted_samples_total: int, sample_rate: int, f
     return emitted_seconds - elapsed_seconds
 
 
+# [调用链入口] 被 app_onnx.py 的 _on_frame 回调调用
+# 根据当前流式超前量动态决定每次 codec 解码的帧批大小（frame_budget）：
+#   超前越多 → 可以一次解码更多帧 → 减少 ONNX session.run 调用次数，提升吞吐
+#   首帧到来前或超前不足 0.20s → 每次只解码 1 帧，优先降低首帧延迟
 def _resolve_stream_decode_frame_budget(
     emitted_samples_total: int,
     sample_rate: int,
@@ -228,17 +278,25 @@ def _resolve_stream_decode_frame_budget(
     return 8
 
 
+# =============================================================================
+# CodecStreamingDecodeSession —— 流式 Codec 解码会话
+# 职责：维护 codec_decode_step ONNX 模型的 KV Cache 状态，逐帧将声学 token 解码为 PCM
+# =============================================================================
+
 @dataclass
 class CodecStreamingDecodeSession:
     codec_meta: dict[str, Any]
     session: ort.InferenceSession
 
+    # [调用链内部] dataclass 自动调用，读取 codec_meta 中的 transformer / attention 规格并初始化状态
     def __post_init__(self) -> None:
         self.transformer_specs = list(self.codec_meta.get("streaming_decode", {}).get("transformer_offsets", []))
         self.attention_specs = list(self.codec_meta.get("streaming_decode", {}).get("attention_caches", []))
         self.state_feeds: dict[str, np.ndarray] = {}
         self.reset()
 
+    # [调用链入口] 被 OrtCpuRuntime.warmup 和 app_onnx.py 调用（每次新请求前重置 KV Cache）
+    # 将所有 transformer offset 和 attention cache（K/V/positions）清零，开启新一轮流式解码
     def reset(self) -> None:
         self.state_feeds = {}
         for spec in self.transformer_specs:
@@ -250,11 +308,15 @@ class CodecStreamingDecodeSession:
             positions = np.full(tuple(spec["positions_shape"]), -1, dtype=np.int32)
             self.state_feeds[str(spec["cached_positions_input_name"])] = positions
 
+    # [调用链入口] 被 app_onnx.py 的 _on_frame 回调调用（流式解码调用链第 6 步 - [实时解码音频]）
+    # 将一批声学 token 帧（frame_rows，每帧含 num_quantizers 个 VQ token）解码为音频波形
+    # 同时更新内部 KV Cache，保持流式解码的上下文连续性
     def run_frames(self, frame_rows: list[list[int]]) -> tuple[np.ndarray, int] | None:
         if not frame_rows:
             return None
         num_quantizers = int(self.codec_meta["codec_config"]["num_quantizers"])
         frame_count = len(frame_rows)
+        # 构造 (1, frame_count, num_quantizers) 的声学 token 输入张量
         audio_codes = np.zeros((1, frame_count, num_quantizers), dtype=np.int32)
         for frame_index, frame_row in enumerate(frame_rows):
             for channel_index in range(num_quantizers):
@@ -263,10 +325,12 @@ class CodecStreamingDecodeSession:
             "audio_codes": audio_codes,
             "audio_code_lengths": np.asarray([frame_count], dtype=np.int32),
         }
+        # 追加 KV Cache 等有状态输入（首次调用时为全零初始状态）
         feeds.update(self.state_feeds)
         outputs = self.session.run(None, feeds)
         output_names = [output.name for output in self.session.get_outputs()]
         named_outputs = dict(zip(output_names, outputs, strict=True))
+        # 将本次输出的 KV Cache 写回 state_feeds，供下次调用续接
         for spec in self.transformer_specs:
             self.state_feeds[str(spec["input_name"])] = named_outputs[str(spec["output_name"])]
         for spec in self.attention_specs:
@@ -280,7 +344,15 @@ class CodecStreamingDecodeSession:
         )
 
 
+# =============================================================================
+# OrtCpuRuntime —— ONNX 推理基类
+# 职责：加载并管理全部 ONNX session，实现 prefill/decode 自回归推理循环
+# OnnxTtsRuntime（onnx_tts_runtime.py）继承此类，添加 TTS 业务逻辑
+# =============================================================================
+
 class OrtCpuRuntime:
+    # [调用链入口] 被 onnx_tts_runtime.py 中 OnnxTtsRuntime.__init__ 通过 super().__init__ 调用
+    # 负责：读取 manifest / tts_meta / codec_meta，创建全部 ONNX session，初始化流式解码会话
     def __init__(
         self,
         model_dir: str | Path,
@@ -295,6 +367,7 @@ class OrtCpuRuntime:
         self.manifest_dir = self.manifest_path.parent
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         self.manifest = manifest
+        # 允许运行时覆盖 manifest 中的生成参数
         if max_new_frames is not None:
             self.manifest["generation_defaults"]["max_new_frames"] = int(max_new_frames)
         if do_sample is not None:
@@ -303,6 +376,7 @@ class OrtCpuRuntime:
             sample_mode if sample_mode is not None else self.manifest["generation_defaults"].get("sample_mode"),
             bool(self.manifest["generation_defaults"]["do_sample"]),
         )
+        # sample_mode 规范化后反写 do_sample：greedy 模式强制关闭采样
         self.manifest["generation_defaults"]["do_sample"] = (
             self.manifest["generation_defaults"]["sample_mode"] != SAMPLE_MODE_GREEDY
         )
@@ -311,12 +385,15 @@ class OrtCpuRuntime:
         self.tts_meta = json.loads(self.tts_meta_path.read_text(encoding="utf-8"))
         self.codec_meta = json.loads(self.codec_meta_path.read_text(encoding="utf-8"))
         self.rng = np.random.default_rng(1234)
+        # 一次性加载所有 ONNX 模型（prefill / decode / local_decoder / codec 等）
         self.sessions = self._create_sessions()
+        # 创建流式 codec 解码会话，绑定 codec_decode_step session
         self.codec_streaming_session = CodecStreamingDecodeSession(
             codec_meta=self.codec_meta,
             session=self.sessions["codec_decode_step"],
         )
 
+    # [调用链内部] 被 __init__ 调用，在模型目录下按优先级搜索 manifest 文件
     @staticmethod
     def _resolve_manifest_path(model_dir: Path) -> Path:
         tried_paths: list[Path] = []
@@ -328,6 +405,8 @@ class OrtCpuRuntime:
         joined = ", ".join(str(path_value) for path_value in tried_paths)
         raise FileNotFoundError(f"browser_poc_manifest.json not found. tried: {joined}")
 
+    # [调用链入口] 被 onnx_tts_runtime.py 调用，将 manifest 中的相对路径解析为绝对路径
+    # 同时处理旧版目录名兼容（MODEL_DIR_ALIAS_MAP）
     def resolve_manifest_relative_path(self, relative_path: str | Path) -> Path:
         relative = Path(relative_path)
         resolved = (self.manifest_dir / relative).resolve()
@@ -344,6 +423,8 @@ class OrtCpuRuntime:
                 return rewritten
         return resolved
 
+    # [调用链内部] 被 _create_sessions 调用，创建单个 ONNX InferenceSession
+    # 固定使用 ORT_ENABLE_BASIC 优化级别和 CUDAExecutionProvider
     def _session(self, path_value: Path) -> ort.InferenceSession:
         options = ort.SessionOptions()
         # options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -353,6 +434,8 @@ class OrtCpuRuntime:
         # return ort.InferenceSession(str(path_value), sess_options=options, providers=["CPUExecutionProvider"])
         return ort.InferenceSession(str(path_value), sess_options=options, providers=["CUDAExecutionProvider"])
 
+    # [调用链内部] 被 __init__ 调用，按 tts_meta / codec_meta 中的文件路径加载所有 ONNX 模型
+    # 可选 session（local_greedy_frame / local_fixed_sampled_frame / local_cached_step）按 manifest 条件加载
     def _create_sessions(self) -> dict[str, ort.InferenceSession]:
         tts_dir = self.tts_meta_path.parent
         codec_dir = self.codec_meta_path.parent
@@ -380,12 +463,16 @@ class OrtCpuRuntime:
             "codec_decode_step": self._session(codec_dir / self.codec_meta["files"]["decode_step"]),
         }
 
+    # [非调用链] 返回 manifest 中内置语音列表，供上层接口展示可用音色
     def list_builtin_voices(self) -> list[dict[str, Any]]:
         return list(self.manifest["builtin_voices"])
 
+    # [非调用链] 返回 manifest 中内置文本示例列表
     def list_text_samples(self) -> list[dict[str, Any]]:
         return list(self.manifest["text_samples"])
 
+    # [非调用链] 服务启动时的预热函数，用于提前触发 ONNX 图优化和算子初始化，降低首次推理延迟
+    # 不在 stream generate 调用链中，运行于服务初始化阶段
     def warmup(self) -> None:
         voice = self.list_builtin_voices()[0]
         text_sample = self.list_text_samples()[0]
@@ -432,6 +519,8 @@ class OrtCpuRuntime:
         self.codec_streaming_session.run_frames(empty_frames)
         self.codec_streaming_session.reset()
 
+    # [调用链内部] 被 build_voice_clone_request_rows 调用
+    # 将文本 token id 列表编码为 (n_vq+1) 宽的行矩阵，音频列填充 audio_pad_token_id
     def build_text_rows(self, token_ids: list[int]) -> list[list[int]]:
         rows: list[list[int]] = []
         row_width = int(self.manifest["tts_config"]["n_vq"]) + 1
@@ -441,6 +530,8 @@ class OrtCpuRuntime:
             rows.append(row)
         return rows
 
+    # [调用链内部] 被 build_voice_clone_request_rows 调用
+    # 将参考音频的声学 token（prompt_audio_codes）编码为带 slot token 标记的行矩阵
     def build_audio_prefix_rows(self, prompt_audio_codes: list[list[int]], slot_token_id: int | None = None) -> list[list[int]]:
         rows: list[list[int]] = []
         row_width = int(self.manifest["tts_config"]["n_vq"]) + 1
@@ -455,6 +546,9 @@ class OrtCpuRuntime:
             rows.append(row)
         return rows
 
+    # [调用链入口] 被 onnx_tts_runtime.py 调用（调用链第 3 步的数据预处理输出）
+    # 将参考音频 codes + 目标文本 token ids 拼接为 prefill 阶段所需的输入矩阵（inputIds + attentionMask）
+    # 格式：[用户 prompt 前缀文本行] + [参考音频行] + [用户 prompt 后缀文本行] + [目标文本行] + [assistant 开头行]
     def build_voice_clone_request_rows(self, prompt_audio_codes: list[list[int]], text_token_ids: list[int]) -> dict[str, list[list[int]]]:
         prefix_text_token_ids = [
             *self.manifest["prompt_templates"]["user_prompt_prefix_token_ids"],
@@ -477,6 +571,8 @@ class OrtCpuRuntime:
             "attentionMask": [[1 for _ in rows]],
         }
 
+    # [调用链内部] 被 generate_audio_frames 的 else 分支（无 local_cached_step）调用
+    # 每次推理需提供当前帧已生成的 audio prefix，对每个 VQ 声道逐步采样
     def run_local_decoder(self, global_hidden: np.ndarray, text_token_id: int, frame_prefix: list[int]) -> tuple[np.ndarray, np.ndarray]:
         n_vq = int(self.manifest["tts_config"]["n_vq"])
         audio_pad = int(self.manifest["tts_config"]["audio_pad_token_id"])
@@ -495,6 +591,8 @@ class OrtCpuRuntime:
         named_outputs = dict(zip(output_names, outputs, strict=True))
         return named_outputs["text_logits"].reshape(-1), named_outputs["audio_logits"]
 
+    # [调用链内部] 被 generate_audio_frames（local_cached_step 分支）调用
+    # 构造空的 local KV Cache，形状由 tts_meta 中的 local_layers/heads/head_dim 决定
     def create_empty_local_cached_past(self) -> dict[str, np.ndarray]:
         local_layers = int(self.tts_meta["model_config"]["local_layers"])
         local_heads = int(self.tts_meta["model_config"]["local_heads"])
@@ -505,6 +603,9 @@ class OrtCpuRuntime:
             for name in (f"local_past_key_{layer_index}", f"local_past_value_{layer_index}")
         }
 
+    # [调用链内部] 被 generate_audio_frames（local_cached_step 分支）在每帧内逐步调用
+    # step_type 区分当前步骤：0=text预测步, 1=首个VQ采样步, 2=后续VQ采样步
+    # 每次调用后需更新 local_past_by_name（帧内局部 KV Cache）
     def run_local_cached_step(
         self,
         global_hidden: np.ndarray,
@@ -536,6 +637,9 @@ class OrtCpuRuntime:
         }
         return named_outputs["text_logits"].reshape(-1), named_outputs["audio_logits"], next_local_past
 
+    # [调用链内部] 被 generate_audio_frames（greedy 模式）调用
+    # 一次 ONNX 推理即可完整输出一帧全部 VQ token（ONNX 内部已完成跨声道 greedy 采样）
+    # should_continue=False 表示模型预测生成结束，终止推理循环
     def run_local_greedy_frame(
         self,
         global_hidden: np.ndarray,
@@ -545,6 +649,7 @@ class OrtCpuRuntime:
     ) -> tuple[bool, list[int]]:
         audio_codebook_size = int(self.tts_meta["model_config"]["audio_codebook_sizes"][0])
         n_vq = int(self.manifest["tts_config"]["n_vq"])
+        # 将每个声道历史 token 集合编码为 mask 矩阵，供 ONNX 内部施加重复惩罚
         repetition_seen_mask = np.zeros((1, n_vq, audio_codebook_size), dtype=np.int32)
         for channel_index, token_ids in enumerate(previous_token_sets_by_channel):
             for token_id in token_ids:
@@ -564,6 +669,9 @@ class OrtCpuRuntime:
         frame_token_ids = np.asarray(named_outputs["frame_token_ids"]).reshape(-1).astype(np.int32, copy=False).tolist()
         return should_continue, [int(item) for item in frame_token_ids]
 
+    # [调用链内部] 被 generate_audio_frames（fixed 采样模式）调用
+    # 与 greedy_frame 类似，但通过外部注入随机数（assistant_random_u / audio_random_u）控制采样，
+    # 使采样过程在 ONNX 内部确定性地执行（固定随机种子可复现）
     def run_local_fixed_sampled_frame(
         self,
         global_hidden: np.ndarray,
@@ -577,6 +685,7 @@ class OrtCpuRuntime:
             for token_id in token_ids:
                 if 0 <= token_id < audio_codebook_size:
                     repetition_seen_mask[0, channel_index, token_id] = 1
+        # 由 Python 侧 RNG 生成随机数，传入 ONNX 内部做逆变换采样，保证与 Python 采样路径一致
         assistant_random_u = np.asarray([min(0.99999994, max(0.0, float(self.rng.random())))], dtype=np.float32)
         audio_random_u = np.asarray(
             [[min(0.99999994, max(0.0, float(self.rng.random()))) for _ in range(n_vq)]],
@@ -597,6 +706,8 @@ class OrtCpuRuntime:
         should_continue = bool(int(np.asarray(named_outputs["should_continue"]).reshape(-1)[0]))
         return should_continue, [int(item) for item in frame_token_ids]
 
+    # [调用链内部] 被 generate_audio_frames（local_cached_step 分支）调用
+    # audio_logits 将所有 VQ 声道的 logits 拼接在一起，此函数按声道索引切片取出目标声道
     def slice_audio_channel_logits(self, audio_logits: np.ndarray, channel_index: int) -> np.ndarray:
         per_channel = int(audio_logits.shape[-1])
         flat = audio_logits.reshape(-1)
@@ -604,6 +715,8 @@ class OrtCpuRuntime:
         end = start + per_channel
         return flat[start:end]
 
+    # [非调用链] 非流式全量音频解码，用于一次性将全部生成帧解码为 PCM
+    # 在 stream generate 路径中不被调用（流式解码使用 CodecStreamingDecodeSession.run_frames）
     def decode_full_audio(self, generated_frames: list[list[int]]) -> tuple[list[np.ndarray], int]:
         if not generated_frames:
             return [], 0
@@ -620,6 +733,18 @@ class OrtCpuRuntime:
         audio_length = int(named_outputs["audio_lengths"].reshape(-1)[0])
         return _slice_channel_major_audio(named_outputs["audio"], 0, audio_length), audio_length
 
+    # [调用链入口] 被 app_onnx.py 的 _worker 线程调用（调用链第 4 步）
+    # 完整实现 prefill → 自回归 decode 循环，每生成一帧触发一次 on_frame 回调
+    #
+    # 推理分为两个阶段：
+    #   1. Prefill：将 request_rows（文本 + 参考音频 prompt）一次性送入 prefill ONNX 模型，
+    #      获取初始 global_hidden 和全量 KV Cache（past_by_name）
+    #   2. Decode 循环：每次迭代生成一帧（n_vq 个 VQ token），共三条执行路径：
+    #      - greedy_frame：整帧一次推理（greedy 模式，最快） → do_sample=true，默认条件不满足
+    #      - fixed_sampled_frame：整帧一次推理（fixed 采样模式，外部注入随机数） → sample_mode=="fixed" 且 session 存在，默认命中
+    #      - local_cached_step：逐声道 n_vq+1 次推理（full 模式或 fallback） → 不会到达
+    #      - local_decoder（else）：无缓存逐声道推理（最慢 fallback） → 不会到达
+    #      每帧生成后，用 decode ONNX 模型更新 global_hidden 和 KV Cache，进入下一帧
     def generate_audio_frames(
         self,
         request_rows: dict[str, list[list[int]]],
@@ -627,6 +752,8 @@ class OrtCpuRuntime:
     ) -> list[list[int]]:
         generation_defaults = self.manifest["generation_defaults"]
         row_width = int(self.manifest["tts_config"]["n_vq"]) + 1
+
+        # ── 阶段 1：Prefill ──────────────────────────────────────────────────
         prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
         prefill_mask, prefill_mask_dims = _flatten2d_int32(request_rows["attentionMask"])
         outputs = self.sessions["prefill"].run(
@@ -638,18 +765,25 @@ class OrtCpuRuntime:
         )
         output_names = [output.name for output in self.sessions["prefill"].get_outputs()]
         named_outputs = dict(zip(output_names, outputs, strict=True))
+        # 取序列最后一步的隐状态作为第一帧生成的条件向量
         global_hidden = _extract_last_hidden(named_outputs["global_hidden"])
+        # past_valid_length 记录 KV Cache 中有效 token 数（随每帧 decode 递增）
         past_valid_length = sum(int(item) for item in request_rows["attentionMask"][0])
         past_by_name = {
             output_name.replace("present_", "past_"): named_outputs[output_name]
             for output_name in self.tts_meta["onnx"]["prefill_output_names"][1:]
         }
+
+        # ── 阶段 2：自回归 Decode 循环 ────────────────────────────────────────
         generated_frames: list[list[int]] = []
+        # 每个 VQ 声道分别维护历史 token 列表和集合，用于重复惩罚计算
         previous_tokens_by_channel = [[] for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
         previous_token_sets_by_channel = [set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
 
         for step_index in range(int(generation_defaults["max_new_frames"])):
             frame: list[int] = []
+
+            # 路径 A：local_greedy_frame（整帧一次推理，greedy 模式）
             if "local_greedy_frame" in self.sessions and not bool(generation_defaults["do_sample"]):
                 should_continue, frame = self.run_local_greedy_frame(
                     global_hidden,
@@ -661,6 +795,8 @@ class OrtCpuRuntime:
                 for channel_index, sampled_token in enumerate(frame):
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
+
+            # 路径 B：local_fixed_sampled_frame（整帧一次推理，fixed 采样模式）
             elif "local_fixed_sampled_frame" in self.sessions and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED:
                 should_continue, frame = self.run_local_fixed_sampled_frame(
                     global_hidden,
@@ -671,9 +807,13 @@ class OrtCpuRuntime:
                 for channel_index, sampled_token in enumerate(frame):
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
+
+            # 路径 C：local_cached_step（逐声道推理，带帧内 KV Cache）
             elif "local_cached_step" in self.sessions:
                 local_past_by_name = self.create_empty_local_cached_past()
                 local_past_valid_length = 0
+
+                # step_type=0：text 预测步，判断是继续生成音频还是结束
                 local_text_logits, _ignored_audio_logits, local_past_by_name = self.run_local_cached_step(
                     global_hidden,
                     text_token_id=0,
@@ -690,8 +830,11 @@ class OrtCpuRuntime:
                     generation_defaults,
                     self.rng,
                 )
+                # 若采样到 audio_end_token，表示生成已结束
                 if next_text_token != int(self.manifest["tts_config"]["audio_assistant_slot_token_id"]):
                     break
+
+                # step_type=1：第 0 声道采样步
                 _unused_text_logits, audio_logits, local_past_by_name = self.run_local_cached_step(
                     global_hidden,
                     text_token_id=next_text_token,
@@ -714,6 +857,7 @@ class OrtCpuRuntime:
                 previous_tokens_by_channel[0].append(sampled_token)
                 previous_token_sets_by_channel[0].add(sampled_token)
 
+                # step_type=2：第 1..n_vq-1 声道依次采样（自回归：每步以上一声道 token 为条件）
                 previous_token = sampled_token
                 host_sampled_channel_limit = int(self.manifest["tts_config"]["n_vq"])
                 for channel_index in range(1, host_sampled_channel_limit):
@@ -739,6 +883,8 @@ class OrtCpuRuntime:
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
                     previous_token = sampled_token
+
+            # 路径 D：local_decoder（无帧内 KV Cache 的 fallback，最慢）
             else:
                 local_text_logits, _ = self.run_local_decoder(global_hidden, 0, [])
                 next_text_token = _sample_assistant_text_token(
@@ -762,8 +908,11 @@ class OrtCpuRuntime:
                     frame.append(sampled_token)
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
+
             generated_frames.append(frame)
 
+            # ── 每帧后：运行 decode ONNX 更新 global_hidden 和 KV Cache ────────
+            # 将本帧的 assistant slot token + 全部 VQ token 组成下一步输入
             next_row = np.full((1, 1, row_width), int(self.manifest["tts_config"]["audio_pad_token_id"]), dtype=np.int32)
             next_row[0, 0, 0] = int(self.manifest["tts_config"]["audio_assistant_slot_token_id"])
             for index, token in enumerate(frame):
@@ -783,6 +932,9 @@ class OrtCpuRuntime:
                 output_name.replace("present_", "past_"): named_decode_outputs[output_name]
                 for output_name in self.tts_meta["onnx"]["decode_output_names"][1:]
             }
+
+            # ── 触发 on_frame 回调（调用链第 5 步）────────────────────────────
+            # app_onnx.py 的 _on_frame 在此被调用，收集足够帧后调用 codec 流式解码
             if on_frame is not None:
                 on_frame(generated_frames, step_index, frame)
         return generated_frames
