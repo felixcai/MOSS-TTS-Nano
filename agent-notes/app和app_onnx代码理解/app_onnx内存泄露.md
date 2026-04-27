@@ -107,6 +107,74 @@
 
 ## 7. 实测日志模式：短请求重复 vs 长文本 + 换音色
 
+### 问题日志
+
+这次做了如下操作：
+
+1、用第一种音色，读了一段文字
+
+2026-04-24 18:02:54,406 INFO root: [MEM] stream_worker: chunk 0 done | proc_rss=1425.7 MB | sys_used=8082.5 MB
+
+2026-04-24 18:02:54,421 INFO root: Nano-TTS stream RTF | stream_id=stream-1777024961315-5aacdad9 | audio_chunks=90 | total_audio_s=15.680 | first_audio_latency_s=0.9795 | rtf_first=12.2410 | rtf_steady=0.7729
+
+2026-04-24 18:02:54,421 INFO root: [MEM] stream_worker: finally exit | proc_rss=1437.3 MB | sys_used=8099.7 MB
+
+2、相同的音色，又读了几次同样的文字：
+
+2026-04-24 18:03:16,482 INFO root: [MEM] stream_worker: chunk 0 done | proc_rss=1467.8 MB | sys_used=8110.3 MB
+
+2026-04-24 18:03:16,497 INFO root: Nano-TTS stream RTF | stream_id=stream-1777024984519-329be8e3 | audio_chunks=70 | total_audio_s=16.400 | first_audio_latency_s=0.4952 | rtf_first=6.1855 | rtf_steady=0.7002
+
+2026-04-24 18:03:16,498 INFO root: [MEM] stream_worker: finally exit | proc_rss=1479.9 MB | sys_used=8126.4 MB
+
+2026-04-24 18:03:34,596 INFO root: normalized text chars_before=103 chars_after=95 stage=robust_pre
+
+2026-04-24 18:03:34,653 INFO root: [MEM] build_runtime: cpu_threads=4 | proc_rss=1469.0 MB | sys_used=8145.6 MB
+
+2026-04-24 18:03:34,654 WARNING root: OnnxRequestRuntimeManager: ignoring cpu_threads=4 (default=8) to avoid loading a second ONNX session; reusing default runtime.
+
+INFO: 127.0.0.1:44110 - "POST /api/generate-stream/start HTTP/1.1" 200 OK
+
+2026-04-24 18:03:34,658 INFO root: [MEM] build_runtime: cpu_threads=4 | proc_rss=1469.0 MB | sys_used=8146.5 MB
+
+2026-04-24 18:03:34,658 WARNING root: OnnxRequestRuntimeManager: ignoring cpu_threads=4 (default=8) to avoid loading a second ONNX session; reusing default runtime.
+
+2026-04-24 18:03:34,660 INFO root: [MEM] stream_worker: start | proc_rss=1469.0 MB | sys_used=8146.5 MB
+
+3、换了一种音色，去读了一段更长的语音
+
+2026-04-24 18:04:45,352 INFO root: normalized text chars_before=579 chars_after=563 stage=robust_pre
+
+2026-04-24 18:04:45,603 INFO root: [MEM] build_runtime: cpu_threads=4 | proc_rss=1507.9 MB | sys_used=8183.1 MB
+
+2026-04-24 18:04:45,603 WARNING root: OnnxRequestRuntimeManager: ignoring cpu_threads=4 (default=8) to avoid loading a second ONNX session; reusing default runtime.
+
+INFO: 127.0.0.1:56340 - "POST /api/generate-stream/start HTTP/1.1" 200 OK
+
+2026-04-24 18:04:45,609 INFO root: [MEM] build_runtime: cpu_threads=4 | proc_rss=1507.9 MB | sys_used=8183.6 MB
+
+2026-04-24 18:04:45,609 WARNING root: OnnxRequestRuntimeManager: ignoring cpu_threads=4 (default=8) to avoid loading a second ONNX session; reusing default runtime.
+
+2026-04-24 18:04:45,610 INFO root: [MEM] stream_worker: start | proc_rss=1507.9 MB | sys_used=8183.6 MB
+
+2026-04-24 18:05:01,251 INFO root: [MEM] stream_worker: chunk 0 done | proc_rss=1624.3 MB | sys_used=10856.9 MB
+
+2026-04-24 18:05:21,599 INFO root: [MEM] stream_worker: chunk 1 done | proc_rss=1672.8 MB | sys_used=10921.1 MB
+
+2026-04-24 18:05:41,821 INFO root: [MEM] stream_worker: chunk 2 done | proc_rss=1688.7 MB | sys_used=10970.9 MB
+
+2026-04-24 18:05:59,819 INFO root: [MEM] stream_worker: chunk 3 done | proc_rss=1698.8 MB | sys_used=10941.1 MB
+
+2026-04-24 18:06:18,303 INFO root: [MEM] stream_worker: chunk 4 done | proc_rss=1708.8 MB | sys_used=10967.6 MB
+
+2026-04-24 18:06:30,754 INFO root: [MEM] stream_worker: chunk 5 done | proc_rss=1716.2 MB | sys_used=10985.7 MB
+
+2026-04-24 18:06:30,853 INFO root: Nano-TTS stream RTF | stream_id=stream-1777025085606-7f5be609 | audio_chunks=294 | total_audio_s=152.560 | first_audio_latency_s=1.5067 | rtf_first=18.8294 | rtf_steady=0.6786
+
+2026-04-24 18:06:30,854 INFO root: [MEM] stream_worker: finally exit | proc_rss=1772.2 MB | sys_used=11041.9 MB
+
+分析一下
+
 ### 7.1 同音色、同短文本多次请求
 
 `sys_used` 每次只有**几十 MB 量级**波动：说明修复后**无宏观泄漏**；小幅上涨可能来自 GC 尚未回收、队列中尚未消费的 PCM、或 ONNX arena 的碎片。
@@ -132,13 +200,13 @@
 
 ### 8.2 Python / 配置侧可做的优化（可操作清单）
 
-| 手段 | 说明 |
-|------|------|
-| **减小 `voice_clone_max_text_tokens`**（请求或前端表单） | 单 chunk 文本更短，降低单次 prefill/decode 的序列峰值，通常直接压低内存尖峰。 |
-| **限制参考音频时长** | 上传或 demo 的 prompt 控制在数秒级即可兼顾音色；过长 prompt 是 KV/前缀长度的主要推手之一。 |
+| 手段                                                          | 说明                                                                                                                                                        |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **减小 `voice_clone_max_text_tokens`**（请求或前端表单）               | 单 chunk 文本更短，降低单次 prefill/decode 的序列峰值，通常直接压低内存尖峰。                                                                                                        |
+| **限制参考音频时长**                                                | 上传或 demo 的 prompt 控制在数秒级即可兼顾音色；过长 prompt 是 KV/前缀长度的主要推手之一。                                                                                                |
 | **ORT SessionOptions（改 `ort_cpu_runtime.py` 的 `_session`）** | 例如 `add_session_config_entry("session.memory_arena_shrink_strategy", "cpu:0")` 鼓励 arena 在空闲时收缩；或 `enable_cpu_mem_arena = False` 换更低常驻、略损性能。需按版本文档验证键名与行为。 |
-| **合理 `cpu_threads`** | 线程本地 arena 可能放大常驻；内存紧张时可适当降低 intra-op 线程数（与启动参数一致，避免误以为请求里改线程会换会话——修复后请求侧线程数已被忽略）。 |
-| **`max_new_frames` 等生成上限** | 限制极端长语音生成的步数，避免最坏情况下的长时间自回归与中间张量堆积。 |
+| **合理 `cpu_threads`**                                        | 线程本地 arena 可能放大常驻；内存紧张时可适当降低 intra-op 线程数（与启动参数一致，避免误以为请求里改线程会换会话——修复后请求侧线程数已被忽略）。                                                                        |
+| **`max_new_frames` 等生成上限**                                  | 限制极端长语音生成的步数，避免最坏情况下的长时间自回归与中间张量堆积。                                                                                                                       |
 
 ---
 
