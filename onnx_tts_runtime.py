@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+# ─────────────────────────────────────────────────────────────────────────────
+# onnx_tts_runtime.py  —— TTS 业务逻辑层（Stream Generate 调用链第 3 层）
+#
+# 在 stream generate 调用链中的位置：
+#   app.py  →  app_onnx.py (synthesize_stream / _worker)
+#           →  本文件 (文本切分、音频编码、Prompt 构建)
+#           →  ort_cpu_runtime.py (generate_audio_frames / codec_decode_step)
+#
+# 函数角色说明（仅 stream generate 视角）：
+#   [调用链入口]  被 app_onnx.py 直接调用或导入的函数
+#   [调用链内部]  仅在本文件内被其他函数调用的函数（支撑入口函数）
+#   [非调用链]    不参与单次 stream generate 请求路径的函数
+# ─────────────────────────────────────────────────────────────────────────────
+
 import logging
 import shutil
 import time
@@ -38,7 +52,7 @@ DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 0.40
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 0.24
 SENTENCE_END_PUNCTUATION = set(".!?。！？；;")
 CLAUSE_SPLIT_PUNCTUATION = set(",，、；;：:")
-CLOSING_PUNCTUATION = set("\"'”’)]}）】》」』")
+CLOSING_PUNCTUATION = set("\"'"')]}）】》」』")
 
 
 MODEL_MANIFEST_CANDIDATE_RELATIVE_PATHS = (
@@ -48,18 +62,27 @@ MODEL_MANIFEST_CANDIDATE_RELATIVE_PATHS = (
 )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 模型目录解析 / 下载辅助函数
+# 这组函数组成 ensure_browser_onnx_model_dir 的调用树，在 __init__ 初始化阶段
+# 执行，属于调用链的「初始化支路」。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# [调用链内部] 被 ensure_browser_onnx_model_dir 和 _default_model_dir_requested 调用
 def _resolve_model_dir_path(model_dir: str | Path | None) -> Path:
     if model_dir is None:
         return DEFAULT_BROWSER_ONNX_MODEL_DIR.expanduser().resolve()
     return Path(model_dir).expanduser().resolve()
 
 
+# [调用链内部] 被 ensure_browser_onnx_model_dir 调用，判断是否使用默认目录
 def _default_model_dir_requested(model_dir: str | Path | None) -> bool:
     if model_dir is None:
         return True
     return _resolve_model_dir_path(model_dir) == DEFAULT_BROWSER_ONNX_MODEL_DIR.expanduser().resolve()
 
 
+# [调用链内部] 被 ensure_browser_onnx_model_dir 调用，遍历候选路径找到 manifest 文件
 def _find_manifest_path(model_dir: Path) -> Path | None:
     for relative_path in MODEL_MANIFEST_CANDIDATE_RELATIVE_PATHS:
         candidate = (model_dir / relative_path).resolve()
@@ -68,10 +91,13 @@ def _find_manifest_path(model_dir: Path) -> Path | None:
     return None
 
 
+# [调用链内部] 被 _find_directory_with_required_names 调用
 def _directory_contains_all(parent: Path, required_names: Sequence[str]) -> bool:
     return all((parent / name).exists() for name in required_names)
 
 
+# [调用链内部] 被 _normalize_download_layout 调用，在下载后的目录树中找到包含所有
+# 必要文件的子目录（解决 HuggingFace snapshot_download 可能带来的嵌套目录问题）
 def _find_directory_with_required_names(root_dir: Path, required_names: Sequence[str]) -> Path | None:
     if not root_dir.exists():
         return None
@@ -85,6 +111,7 @@ def _find_directory_with_required_names(root_dir: Path, required_names: Sequence
     return None
 
 
+# [调用链内部] 被 _normalize_download_layout 调用，把嵌套子目录的文件提升到目标目录
 def _promote_directory_contents(source_dir: Path, target_dir: Path) -> None:
     if source_dir.resolve() == target_dir.resolve():
         return
@@ -96,6 +123,7 @@ def _promote_directory_contents(source_dir: Path, target_dir: Path) -> None:
         shutil.move(str(child), str(destination))
 
 
+# [调用链内部] 被 _download_default_browser_onnx_assets 调用，整理下载后的目录布局
 def _normalize_download_layout(target_dir: Path, required_names: Sequence[str]) -> None:
     candidate_dir = _find_directory_with_required_names(target_dir, required_names)
     if candidate_dir is None:
@@ -103,6 +131,8 @@ def _normalize_download_layout(target_dir: Path, required_names: Sequence[str]) 
     _promote_directory_contents(candidate_dir, target_dir)
 
 
+# [调用链内部] 被 _download_default_browser_onnx_assets 调用，封装 huggingface_hub
+# 的 snapshot_download，按 allow_patterns 只下载必要文件
 def _snapshot_download_repo(
     *,
     repo_id: str,
@@ -124,6 +154,8 @@ def _snapshot_download_repo(
     )
 
 
+# [调用链内部] 被 ensure_browser_onnx_model_dir 调用，当默认模型目录不存在时
+# 分别下载 TTS 模型和 Codec 模型，并整理目录结构
 def _download_default_browser_onnx_assets(model_dir: Path) -> None:
     logging.info("browser_onnx assets missing under %s; downloading from Hugging Face.", model_dir)
     logging.info("browser_onnx TTS repo: %s", DEFAULT_BROWSER_ONNX_TTS_REPO_URL)
@@ -150,16 +182,21 @@ def _download_default_browser_onnx_assets(model_dir: Path) -> None:
     )
 
 
+# [调用链内部] 被 OnnxTtsRuntime.__init__ 调用
+# 快速路径：若 manifest 已存在则直接返回；否则（仅允许默认目录）触发自动下载
 def ensure_browser_onnx_model_dir(model_dir: str | Path | None = None) -> Path:
     resolved_model_dir = _resolve_model_dir_path(model_dir)
+    # 快速路径：manifest 已就位，无需下载
     manifest_path = _find_manifest_path(resolved_model_dir)
     if manifest_path is not None:
         return resolved_model_dir
+    # 非默认目录时不尝试自动下载，直接报错
     if not _default_model_dir_requested(model_dir):
         tried_paths = [str((resolved_model_dir / item).resolve()) for item in MODEL_MANIFEST_CANDIDATE_RELATIVE_PATHS]
         raise FileNotFoundError(
             "browser_onnx model assets not found under the provided --model-dir. tried: " + ", ".join(tried_paths)
         )
+    # 默认目录 + 文件缺失：从 HuggingFace 自动下载 TTS 和 Codec ONNX 资产
     _download_default_browser_onnx_assets(resolved_model_dir)
     manifest_path = _find_manifest_path(resolved_model_dir)
     if manifest_path is None:
@@ -172,6 +209,14 @@ def ensure_browser_onnx_model_dir(model_dir: str | Path | None = None) -> Path:
     return resolved_model_dir
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 文本切分辅助函数
+# 这组函数组成 split_voice_clone_text 的调用树，负责将原始用户文本按句/分句/
+# token 预算切分为多个 text_chunk，是 stream generate 前置数据预处理的一部分。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# [调用链内部] 被 _prepare_text_for_sentence_chunking 和 _join_sentence_parts 调用
+# 检测文本是否含 CJK 字符，以选择不同的标点和拼接规则
 def _contains_cjk(text: str) -> bool:
     for character in str(text or ""):
         if (
@@ -184,6 +229,8 @@ def _contains_cjk(text: str) -> bool:
     return False
 
 
+# [调用链内部] 被 split_voice_clone_text 调用，对原始文本做清理：
+# 去除多余空格、补全末尾标点、对短英文文本补前导空格（避免分词歧义）
 def _prepare_text_for_sentence_chunking(text: str) -> str:
     normalized_text = str(text or "").strip()
     if not normalized_text:
@@ -204,6 +251,8 @@ def _prepare_text_for_sentence_chunking(text: str) -> str:
     return normalized_text
 
 
+# [调用链内部] 被 split_voice_clone_text 调用，按指定标点集对文本做第一/二层切分
+# 同时处理右括号等关闭标点（将其保留在当前句末，不拆到下一句）
 def _split_text_by_punctuation(text: str, punctuation: set[str]) -> list[str]:
     sentences: list[str] = []
     current_chars: list[str] = []
@@ -232,6 +281,8 @@ def _split_text_by_punctuation(text: str, punctuation: set[str]) -> list[str]:
     return sentences
 
 
+# [调用链内部] 被 split_voice_clone_text 调用，拼接两段文本时根据是否 CJK 决定是否
+# 插入空格（中文无需空格，英文需要）
 def _join_sentence_parts(left: str, right: str) -> str:
     if not left:
         return right
@@ -242,6 +293,13 @@ def _join_sentence_parts(left: str, right: str) -> str:
     return f"{left} {right}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 音频工具函数（被 app_onnx.py 直接导入使用）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# [调用链入口] 被 app_onnx.py 直接导入并调用（在 _decode_pending 闭包中）
+# 将 codec 解码输出的多个声道数组（各 shape=(samples,)）堆叠为 (samples, channels) 波形
+# 同时对多声道情况裁剪到最短声道长度，保证各维度对齐
 def _merge_audio_channels(channel_arrays: list[np.ndarray]) -> np.ndarray:
     if not channel_arrays:
         return np.zeros((0, 1), dtype=np.float32)
@@ -252,6 +310,8 @@ def _merge_audio_channels(channel_arrays: list[np.ndarray]) -> np.ndarray:
     return np.stack(trimmed, axis=1)
 
 
+# [调用链入口] 被 app_onnx.py 直接导入并调用（在 _worker 末尾）
+# 把某个 text_chunk 所有流式解码输出的小段波形（emitted_chunks）拼接为完整波形
 def _concat_waveforms(waveforms: list[np.ndarray]) -> np.ndarray:
     if not waveforms:
         return np.zeros((0, 1), dtype=np.float32)
@@ -262,6 +322,8 @@ def _concat_waveforms(waveforms: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(non_empty, axis=0)
 
 
+# [调用链入口] 被 app_onnx.py 直接导入并调用（在 _worker 最后阶段）
+# 在所有 text_chunk 处理完毕后，把最终完整波形写入磁盘（app_onnx_stream_output.wav）
 def _write_waveform_to_wav(path: str | Path, waveform: np.ndarray, sample_rate: int) -> Path:
     output_path = Path(path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,7 +340,17 @@ def _write_waveform_to_wav(path: str | Path, waveform: np.ndarray, sample_rate: 
     return output_path
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OnnxTtsRuntime 类：TTS 业务逻辑层，继承自 OrtCpuRuntime（底层 ONNX 推理层）
+# ══════════════════════════════════════════════════════════════════════════════
+
 class OnnxTtsRuntime(OrtCpuRuntime):
+
+    # [调用链入口] 被 app_onnx.py 的 OnnxNanoTTSServiceAdapter.__init__ 调用
+    # 初始化顺序：
+    #   1. ensure_browser_onnx_model_dir  → 确认/下载 ONNX 模型文件
+    #   2. super().__init__               → 读取 manifest/meta、创建全部 ONNX InferenceSession
+    #   3. 加载 SentencePiece tokenizer   → 用于 encode_text 的文本分词
     def __init__(
         self,
         model_dir: str | Path | None = None,
@@ -289,7 +361,9 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         sample_mode: str | None = None,
         output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     ) -> None:
+        # 确认模型目录有效，必要时触发 HuggingFace 下载
         resolved_model_dir = ensure_browser_onnx_model_dir(model_dir)
+        # 调用父类 OrtCpuRuntime 完成所有 ONNX InferenceSession 的创建
         super().__init__(
             model_dir=resolved_model_dir,
             thread_count=thread_count,
@@ -299,11 +373,14 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         )
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # 从 manifest 解析 tokenizer 路径并加载 SentencePiece 模型
         tokenizer_relative_path = str(self.manifest["model_files"].get("tokenizer_model", "tokenizer.model"))
         tokenizer_path = self.resolve_manifest_relative_path(tokenizer_relative_path)
         self.sp_model = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
         self._text_normalizer_manager: WeTextProcessingManager | None = None
 
+    # [非调用链] 仅被 prepare_synthesis_text 调用，而 prepare_synthesis_text
+    # 只在非 stream 路径的 synthesize 方法中使用
     def _ensure_text_normalizer(self, enable_wetext: bool) -> WeTextProcessingManager | None:
         if not enable_wetext:
             return None
@@ -314,12 +391,17 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             raise RuntimeError(snapshot.error or snapshot.message)
         return self._text_normalizer_manager
 
+    # [调用链入口] 被 app_onnx.py 的 _worker 线程调用（每个 text_chunk 调用一次）
+    # 使用 SentencePiece 将文本转换为 token ID 列表，供 build_voice_clone_request_rows 使用
     def encode_text(self, text: str) -> list[int]:
         return [int(token_id) for token_id in self.sp_model.encode(str(text or ""), out_type=int)]
 
+    # [调用链内部] 被 split_voice_clone_text 和 split_text_by_token_budget 调用
+    # 通过实际 encode 计算 token 数量，用于判断分块是否超出预算
     def count_text_tokens(self, text: str) -> int:
         return len(self.encode_text(text))
 
+    # [非调用链] 仅被非 stream 路径的 synthesize 调用，用于文本正则化预处理
     def prepare_synthesis_text(
         self,
         *,
@@ -339,6 +421,8 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             text_normalizer_manager=text_normalizer_manager,
         )
 
+    # [调用链内部] 被 split_voice_clone_text 调用（当单个分句/子句仍超出 token 预算时）
+    # 用二分查找找到不超出 max_tokens 的最长字符前缀，并在最近的边界字符处截断
     def split_text_by_token_budget(self, text: str, max_tokens: int) -> list[str]:
         remaining_text = str(text or "").strip()
         if not remaining_text:
@@ -349,6 +433,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             if self.count_text_tokens(remaining_text) <= max_tokens:
                 pieces.append(remaining_text)
                 break
+            # 二分查找满足 token 预算的最长字符前缀长度
             low = 1
             high = len(remaining_text)
             best_prefix_length = 1
@@ -365,6 +450,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                     high = middle - 1
             cut_index = best_prefix_length
             prefix = remaining_text[:best_prefix_length]
+            # 在最大前缀末尾的 25 个字符内，向前扫描是否有自然边界字符，优先在此断开
             preferred_index = -1
             scan_min = max(-1, len(prefix) - 25)
             for scan_index in range(len(prefix) - 1, scan_min, -1):
@@ -381,12 +467,21 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             remaining_text = remaining_text[cut_index:].strip()
         return pieces
 
+    # [调用链入口] 被 app_onnx.py 的 _worker 线程调用，是文本预处理的核心
+    # 三层切分策略：
+    #   第一层：按句末标点（。！？等）切分为独立句子
+    #   第二层：若单句超出 token 预算，则进一步按子句标点（，、等）切分
+    #   第三层：若子句仍超出预算，则调用 split_text_by_token_budget 做 token 级二分切割
+    # 切分后再按 token 预算贪心合并相邻小片段，减少总 chunk 数量
+    # 特殊处理：若最终只切出一个 chunk，则返回原始文本（避免过度切分改变语义）
     def split_voice_clone_text(self, text: str, max_tokens: int = 75) -> list[str]:
         normalized_text = str(text or "").strip()
         if not normalized_text:
             return []
         safe_max_tokens = max(1, int(max_tokens))
+        # 清理文本并补全末尾标点，确保句子能被正确识别
         prepared_text = _prepare_text_for_sentence_chunking(normalized_text)
+        # 第一层：按句末标点切分
         sentence_candidates = _split_text_by_punctuation(prepared_text, SENTENCE_END_PUNCTUATION) or [prepared_text.strip()]
         sentence_slices: list[tuple[int, str]] = []
         for sentence_text in sentence_candidates:
@@ -397,6 +492,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             if sentence_token_count <= safe_max_tokens:
                 sentence_slices.append((sentence_token_count, normalized_sentence))
                 continue
+            # 第二层：句子过长，按子句标点进一步切分
             clause_candidates = _split_text_by_punctuation(normalized_sentence, CLAUSE_SPLIT_PUNCTUATION)
             if len(clause_candidates) <= 1:
                 clause_candidates = [normalized_sentence]
@@ -408,10 +504,12 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                 if clause_token_count <= safe_max_tokens:
                     sentence_slices.append((clause_token_count, normalized_clause))
                     continue
+                # 第三层：子句仍超出预算，使用二分查找强制截断
                 for piece in self.split_text_by_token_budget(normalized_clause, safe_max_tokens):
                     normalized_piece = piece.strip()
                     if normalized_piece:
                         sentence_slices.append((self.count_text_tokens(normalized_piece), normalized_piece))
+        # 贪心合并：将相邻小片段合并，直到合并后超出 token 预算为止
         chunks: list[str] = []
         current_chunk = ""
         current_chunk_token_count = 0
@@ -429,8 +527,13 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                 current_chunk_token_count = self.count_text_tokens(current_chunk)
         if current_chunk:
             chunks.append(current_chunk.strip())
+        # 若只切出一个 chunk，返回原始文本而非处理后文本，保持原始语义
         return chunks if len(chunks) > 1 else [normalized_text]
 
+    # [调用链入口] 被 app_onnx.py 的 _worker 线程调用（处理相邻两个 text_chunk 之间）
+    # 根据 text_chunk 的单词数决定片段间静音时长：
+    #   ≤4 个词（短句/标题类）→ 较长停顿（0.40s），短句本身时长短，需要更长间隔补偿呼吸感
+    #   >4 个词（正常句子）→ 较短停顿（0.24s），长句已有足够时长，短停顿维持语流连贯即可
     def estimate_voice_clone_inter_chunk_pause_seconds(self, text_chunk: str) -> float:
         word_count = len([item for item in str(text_chunk or "").strip().split() if item])
         return (
@@ -439,6 +542,8 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             else DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS
         )
 
+    # [调用链内部] 被 encode_reference_audio 调用
+    # 加载参考音频并做归一化：重采样到 codec 要求的采样率，转换到目标声道数
     def _load_reference_audio(self, reference_audio_path: str | Path) -> np.ndarray:
         waveform, sample_rate = torchaudio.load(str(Path(reference_audio_path).expanduser().resolve()))
         waveform = waveform.to(torch.float32)
@@ -457,9 +562,13 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             raise ValueError(f"Unsupported reference audio channel conversion: {current_channels} -> {target_channels}")
         return waveform.unsqueeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
+    # [调用链内部] 被 resolve_prompt_audio_codes 调用（当传入自定义参考音频路径时）
+    # 调用 ONNX codec_encode Session 将参考音频波形编码为离散声学 token 序列
+    # 返回值 prompt_audio_codes: list[list[int]]，shape 为 [frames, num_quantizers]
     def encode_reference_audio(self, reference_audio_path: str | Path) -> list[list[int]]:
         waveform = self._load_reference_audio(reference_audio_path)
         waveform_length = int(waveform.shape[-1])
+        # 运行 ONNX codec_encode 会话，输入为波形张量和长度
         outputs = self.sessions["codec_encode"].run(
             None,
             {
@@ -467,12 +576,15 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                 "input_lengths": np.asarray([waveform_length], dtype=np.int32),
             },
         )
+        # 通过 output name 映射取结果，避免依赖输出顺序
         output_names = [output.name for output in self.sessions["codec_encode"].get_outputs()]
         named_outputs = dict(zip(output_names, outputs, strict=True))
         audio_codes = np.asarray(named_outputs["audio_codes"], dtype=np.int32)
         audio_code_lengths = np.asarray(named_outputs["audio_code_lengths"], dtype=np.int32)
+        # code_length 表示有效帧数（时间维度），裁剪掉 padding 部分
         code_length = int(audio_code_lengths.reshape(-1)[0])
         num_quantizers = int(self.codec_meta["codec_config"]["num_quantizers"])
+        # 将 [1, frames, quantizers] 张量转换为 list[list[int]] 格式
         prompt_audio_codes: list[list[int]] = []
         for frame_index in range(code_length):
             prompt_audio_codes.append(
@@ -480,6 +592,10 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             )
         return prompt_audio_codes
 
+    # [调用链入口] 被 app_onnx.py 的 _worker 线程调用，是 Prompt 音频准备的统一入口
+    # 两个分支：
+    #   有 prompt_audio_path → 编码自定义参考音频（encode_reference_audio）
+    #   无 prompt_audio_path → 从 manifest 内置音色列表中查找对应 voice 的预编码 codes
     def resolve_prompt_audio_codes(
         self,
         *,
@@ -487,13 +603,22 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         prompt_audio_path: str | Path | None,
     ) -> list[list[int]]:
         if prompt_audio_path:
+            # 用户提供了自定义参考音频，实时编码
             return self.encode_reference_audio(prompt_audio_path)
+        # 使用内置音色：从 manifest 预编码的 prompt_audio_codes 中读取
         resolved_voice = str(voice or self.list_builtin_voices()[0]["voice"])
         voice_row = next((item for item in self.list_builtin_voices() if item["voice"] == resolved_voice), None)
         if voice_row is None:
             raise ValueError(f"Built-in voice not found: {resolved_voice}")
         return list(voice_row["prompt_audio_codes"])
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # 以下函数不参与 stream generate 路径
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # [非调用链] 仅被 synthesize_single_chunk 调用（通过 synthesize 的非 stream 路径）
+    # 对完整 generated_frames 做一次性 codec 全量解码；stream 路径使用
+    # CodecStreamingDecodeSession.run_frames 逐帧解码，不走此函数
     def decode_full_audio_safe(self, generated_frames: list[list[int]]) -> np.ndarray:
         try:
             channel_arrays, _audio_length = self.decode_full_audio(generated_frames)
@@ -521,6 +646,11 @@ class OnnxTtsRuntime(OrtCpuRuntime):
                 [np.concatenate(chunks) if chunks else np.zeros((0,), dtype=np.float32) for chunks in merged_by_channel]
             )
 
+    # [非调用链] 仅被 synthesize 调用
+    # 注意：此方法内部包含与 app_onnx.py _worker 类似的流式解码逻辑（on_frame 回调），
+    # 但 app_onnx.py 的 stream generate 路径绕过了此方法，直接在 _worker 中
+    # 调用 encode_text / build_voice_clone_request_rows / generate_audio_frames。
+    # synthesize_single_chunk 的流式分支仅供独立调用 synthesize(streaming=True) 时使用。
     def synthesize_single_chunk(
         self,
         *,
@@ -645,6 +775,10 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             "stream_metrics": stream_metrics,
         }
 
+    # [非调用链] 被 app_onnx.py 的 OnnxNanoTTSServiceAdapter.synthesize 调用（非 stream 路径）
+    # 完整合成流程：文本正则化 → 文本切分 → 逐 chunk 推理 → 拼接音频 → 写入磁盘
+    # stream generate 路径不经过此函数，app_onnx.py 的 synthesize_stream._worker 直接
+    # 调用 resolve_prompt_audio_codes / split_voice_clone_text / encode_text 等底层方法
     def synthesize(
         self,
         *,

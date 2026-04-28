@@ -96,7 +96,7 @@
 
 ## 5 内存阶梯式上涨且不回落的核心逻辑
 
-在流式生成过程中，系统内存（或显存）经常表现出“阶梯式上涨且不回落”的现象。这并非 Python 脚本发生了内存泄漏，而是由以下三个核心机制共同决定的：
+在流式生成过程中，系统内存（或显存）经常表现出"阶梯式上涨且不回落"的现象。这并非 Python 脚本发生了内存泄漏，而是由以下三个核心机制共同决定的：
 
 1. **切分处理（Text Chunking）**：长文本会被切分为多个独立的 `text_chunk` 逐个处理。
 2. **完整推理循环**：每个 `text_chunk` 都要带着参考音频（音色），独立经历一次完整的、极其消耗内存的 `Prefill`（计算全局 Attention）和 `Decode`（自回归生成并累积 KV Cache）循环。
@@ -106,4 +106,195 @@
 
 - 换了**更长的参考音频**（导致 `Prefill` 初始张量变大）会涨内存。
 - 遇到了**更长的 `text_chunk`**（导致 `Decode` 步数变多，KV Cache 峰值变大）也会涨内存。
-- 只要后续请求不打破历史的“最大连续内存需求纪录”，内存就几乎不再上涨。
+- 只要后续请求不打破历史的"最大连续内存需求纪录"，内存就几乎不再上涨。
+
+---
+
+# `onnx_tts_runtime.py` 函数调用分类（仅 Stream Generate 调用链视角）
+
+以下分类对应 `onnx_tts_runtime.py` 中各函数在 **ONNX 流式生成（stream generate）** 路径上的角色。函数角色定义：
+
+- **调用链入口**：被 `app_onnx.py` 直接调用或导入的函数
+- **调用链内部**：仅在本文件内被其他函数调用，支撑入口函数完成工作
+- **非调用链**：不参与单次 stream generate 请求路径的函数
+
+## 1 调用链入口函数（被 app_onnx.py 直接调用/导入）
+
+| 函数                                               | 调用方（stream generate 路径）                       | 说明                                             |
+| ------------------------------------------------ | --------------------------------------------- | ---------------------------------------------- |
+| `_merge_audio_channels`                          | `app_onnx.py` `_decode_pending` 闭包（直接 import） | 将 codec 解码输出的多声道数组堆叠为 `(samples, channels)` 波形 |
+| `_concat_waveforms`                              | `app_onnx.py` `_worker`（直接 import）            | 把某 text_chunk 所有流式解码小段波形拼接为完整波形                |
+| `_write_waveform_to_wav`                         | `app_onnx.py` `_worker` 末尾（直接 import）         | 所有 chunk 处理完毕后将最终波形写入磁盘                        |
+| `OnnxTtsRuntime.__init__`                        | `OnnxNanoTTSServiceAdapter.__init__`          | 确认/下载模型、创建 ONNX Session、加载 tokenizer           |
+| `resolve_prompt_audio_codes`                     | `_worker` 第一步                                 | 统一入口：自定义音频走编码路径，内置音色从 manifest 读取预编码 codes     |
+| `split_voice_clone_text`                         | `_worker` 第二步                                 | 三层策略将长文本切分为不超过 token 预算的 text_chunk 列表         |
+| `encode_text`                                    | `_worker` 循环内（每个 chunk 一次）                    | SentencePiece 分词，将文本转为 token ID 列表             |
+| `estimate_voice_clone_inter_chunk_pause_seconds` | `_worker` 循环内（每两个 chunk 之间）                   | 根据词数决定相邻 chunk 间的静音时长（0.24s 或 0.40s）           |
+
+## 2 调用链内部函数（仅本文件内部调用）
+
+### 2.1 初始化支路（`__init__` → `ensure_browser_onnx_model_dir` 分支）
+
+| 函数                                      | 调用方                                                            | 说明                                      |
+| --------------------------------------- | -------------------------------------------------------------- | --------------------------------------- |
+| `ensure_browser_onnx_model_dir`         | `OnnxTtsRuntime.__init__`                                      | 快速路径检查 manifest；缺失时自动下载 ONNX 资产         |
+| `_resolve_model_dir_path`               | `ensure_browser_onnx_model_dir`、`_default_model_dir_requested` | 将 `model_dir` 参数规范化为绝对路径                |
+| `_default_model_dir_requested`          | `ensure_browser_onnx_model_dir`                                | 判断是否使用默认目录，决定是否允许自动下载                   |
+| `_find_manifest_path`                   | `ensure_browser_onnx_model_dir`                                | 遍历候选相对路径，找到 `browser_poc_manifest.json` |
+| `_download_default_browser_onnx_assets` | `ensure_browser_onnx_model_dir`                                | 分别下载 TTS 和 Codec ONNX 资产并整理目录结构         |
+| `_snapshot_download_repo`               | `_download_default_browser_onnx_assets`                        | 封装 `huggingface_hub.snapshot_download`  |
+| `_normalize_download_layout`            | `_download_default_browser_onnx_assets`                        | 将 HuggingFace 下载产生的嵌套目录铺平到目标目录          |
+| `_find_directory_with_required_names`   | `_normalize_download_layout`                                   | 在目录树中找到包含所有必要文件的子目录                     |
+| `_promote_directory_contents`           | `_normalize_download_layout`                                   | 将子目录内容提升（move）到目标目录                     |
+| `_directory_contains_all`               | `_find_directory_with_required_names`                          | 检查目录是否包含所有 required 文件名                 |
+
+### 2.2 文本切分支路（`split_voice_clone_text` → 各辅助函数）
+
+| 函数                                    | 调用方                                                          | 说明                           |
+| ------------------------------------- | ------------------------------------------------------------ | ---------------------------- |
+| `_prepare_text_for_sentence_chunking` | `split_voice_clone_text`                                     | 清理文本、补全末尾标点、对短英文补前导空格        |
+| `_split_text_by_punctuation`          | `split_voice_clone_text`                                     | 按指定标点集切分句子/子句，保留右括号等关闭标点     |
+| `_join_sentence_parts`                | `split_voice_clone_text`                                     | 合并两段文本时根据 CJK 判断是否插入空格       |
+| `_contains_cjk`                       | `_prepare_text_for_sentence_chunking`、`_join_sentence_parts` | 检测文本是否含 CJK 字符，以选择不同处理规则     |
+| `count_text_tokens`                   | `split_voice_clone_text`、`split_text_by_token_budget`        | 实际 encode 并返回 token 数，用于预算判断 |
+| `split_text_by_token_budget`          | `split_voice_clone_text`                                     | 二分查找最长合法前缀并在自然边界处截断（第三层兜底）   |
+
+### 2.3 音频编码支路（`resolve_prompt_audio_codes` → 各辅助函数）
+
+| 函数                       | 调用方                          | 说明                                              |
+| ------------------------ | ---------------------------- | ----------------------------------------------- |
+| `encode_reference_audio` | `resolve_prompt_audio_codes` | 调用 ONNX `codec_encode` Session 将参考音频编码为离散 token |
+| `_load_reference_audio`  | `encode_reference_audio`     | 加载音频文件并重采样/转换声道数，输出符合 codec 要求的 numpy 张量        |
+
+## 3 非调用链函数（不参与单次 Stream Generate 主路径）
+
+| 函数                        | 说明                                                                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `_ensure_text_normalizer` | 仅被 `prepare_synthesis_text` 调用，用于文本正则化，stream 路径跳过文本正则化                                                                                                |
+| `prepare_synthesis_text`  | 仅被非 stream 路径的 `synthesize` 调用                                                                                                                         |
+| `decode_full_audio_safe`  | 全量 codec 解码；stream 路径使用 `CodecStreamingDecodeSession.run_frames` 逐帧解码                                                                                  |
+| `synthesize_single_chunk` | 仅被 `synthesize` 调用；stream generate 路径中 `app_onnx.py` 的 `_worker` 绕过此函数，直接调用 `encode_text` / `build_voice_clone_request_rows` / `generate_audio_frames` |
+| `synthesize`              | 被 `app_onnx.py` 的非 stream `OnnxNanoTTSServiceAdapter.synthesize` 调用，不在 stream 路径上                                                                      |
+
+## 4 stream generate 路径在本文件的完整调用树
+
+```
+app_onnx.py  OnnxNanoTTSServiceAdapter.__init__
+  └─ OnnxTtsRuntime.__init__                         [入口]
+       ├─ ensure_browser_onnx_model_dir              [内部]
+       │    ├─ _resolve_model_dir_path               [内部]
+       │    ├─ _default_model_dir_requested          [内部]
+       │    ├─ _find_manifest_path                   [内部]
+       │    └─ _download_default_browser_onnx_assets [内部]
+       │         ├─ _snapshot_download_repo          [内部]
+       │         └─ _normalize_download_layout       [内部]
+       │              ├─ _find_directory_with_required_names [内部]
+       │              │    └─ _directory_contains_all        [内部]
+       │              └─ _promote_directory_contents         [内部]
+       └─ (OrtCpuRuntime.__init__ 创建所有 ONNX Session)
+
+app_onnx.py  synthesize_stream._worker
+  ├─ runtime.resolve_prompt_audio_codes              [入口]
+  │    └─ encode_reference_audio                     [内部]
+  │         └─ _load_reference_audio                 [内部]
+  ├─ runtime.split_voice_clone_text                  [入口]
+  │    ├─ _prepare_text_for_sentence_chunking        [内部]
+  │    │    └─ _contains_cjk                         [内部]
+  │    ├─ _split_text_by_punctuation                 [内部]
+  │    ├─ _join_sentence_parts                       [内部]
+  │    │    └─ _contains_cjk                         [内部]
+  │    ├─ count_text_tokens                          [内部]
+  │    └─ split_text_by_token_budget                 [内部]
+  │         └─ count_text_tokens                     [内部]
+  ├─ runtime.encode_text            (每 chunk)       [入口]
+  ├─ (runtime.build_voice_clone_request_rows → ort_cpu_runtime.py)
+  ├─ (runtime.generate_audio_frames → ort_cpu_runtime.py)
+  ├─ runtime.estimate_voice_clone_inter_chunk_pause_seconds [入口]
+  ├─ _merge_audio_channels          (直接 import)    [入口]
+  ├─ _concat_waveforms              (直接 import)    [入口]
+  └─ _write_waveform_to_wav         (直接 import)    [入口]
+```
+
+---
+
+## 5 stream generate 路径的内存积累分析（`_worker` 视角）
+
+### 5.1 `_worker` 的调用粒度
+
+`_worker` 是**一次 HTTP 请求启动一次**的后台线程（由 `synthesize_stream` 创建）。所有 text chunk 均在**同一个 `_worker` 调用**内的 `for chunk_index, chunk_text in enumerate(text_chunks)` 循环中串行处理，不存在"每个 chunk 启动一个 worker"的情况。因此"`_worker` 生命周期"与"一次完整请求的生命周期"等价。
+
+### 5.2 路径上三个内存积累点
+
+以下三处在 `_worker` 内持续占用内存，但**均随 `_worker` 退出而变为可回收状态**，不跨请求泄漏。
+
+#### 积累点 1：`all_generated_frames`（死代码，完全无用）
+
+```python
+all_generated_frames: list[list[int]] = []          # _worker 开头声明
+
+for chunk_index, chunk_text in enumerate(text_chunks):
+    generated_frames = self.runtime.generate_audio_frames(...)
+    all_generated_frames.extend(generated_frames)   # 每个 chunk 追加
+
+# 末尾 _format_result_payload 根本不接收 all_generated_frames
+_safe_put({"type": "result", **self._format_result_payload(waveform=waveform, ...)})
+```
+
+`all_generated_frames` 随总音频帧数线性增长，但最终 result payload 完全不使用它，是纯粹的死代码积累。
+
+**可回收时机**：`_worker` 函数退出（所有 chunk 处理完毕 + sentinel 入队后返回）。整个请求期间持续存活。
+
+#### 积累点 2：`_emit_waveform` 内的双份 PCM 拷贝
+
+```python
+def _emit_waveform(waveform, *, is_pause):
+    emitted_chunks.append(np.asarray(waveform, dtype=np.float32))   # 拷贝 1
+    _safe_put({
+        "waveform_numpy": np.asarray(waveform, dtype=np.float32),   # 拷贝 2
+        ...
+    })
+```
+
+每次发出一段音频，同一份 PCM 数据会产生两个独立 numpy 对象。
+
+**可回收时机**：
+
+- 拷贝 1（存入 `emitted_chunks`）：对 chunk 0…N-2，下一轮循环体执行 `emitted_chunks = []` 时旧列表引用归零，随即可回收；对最后一个 chunk，要等 `_worker` 退出。
+- 拷贝 2（存入队列 dict）：消费端（`synthesize_stream` 的 `while True: event_queue.get()` 循环）处理下一个 item 时，前一个 dict 引用归零，随即可回收。正常情况下释放较及时；若队列积压满（`maxsize=128`），则最多 128 份并存。
+
+#### 积累点 3：`all_waveforms` + 最终拼接的 2× 峰值
+
+```python
+all_waveforms: list[np.ndarray] = []          # _worker 开头声明，持续追加
+
+for ...:
+    chunk_waveform = _concat_waveforms(emitted_chunks)
+    all_waveforms.append(chunk_waveform)       # 每 chunk 完成后追加
+
+# 所有 chunk 结束后：
+waveform = _concat_waveforms(all_waveforms)    # ← 与 all_waveforms 同时存活，达到 2× 峰值
+output_path = _write_waveform_to_wav(...)      # 内部还产生 clipped + pcm16 中间数组
+```
+
+在 `_worker` 末尾，`all_waveforms`（各 chunk 波形列表）和 `waveform`（最终拼接大数组）同时存活，内存中同时持有约 **2× 总音频 PCM 数据**。这对应日志中 `chunk N done` → `finally exit` 阶段的 proc_rss 跳升（约 +56 MB）。
+
+**可回收时机**：`_worker` 函数退出时。`_format_result_payload` 里的 `"waveform_numpy"` 会再持有一个引用进队列，该引用在消费端处理 result item 后才释放。
+
+### 5.3 生命周期汇总
+
+| 内存对象                                 | 可回收时机                                  | 存活跨度                   |
+| ------------------------------------ | -------------------------------------- | ---------------------- |
+| `all_generated_frames`（全部帧，死代码）      | `_worker` 函数退出                         | 整个请求                   |
+| `emitted_chunks` 小段数组（chunk 0…N-2）   | 下一 chunk 循环体执行 `emitted_chunks = []` 时 | 相邻两个 chunk 之间          |
+| `emitted_chunks` 小段数组（最后 chunk）      | `_worker` 函数退出                         | 请求尾段                   |
+| 队列 dict 的 `waveform_numpy`（audio 事件） | 消费端处理下一个 item 时                        | 队列持有期间（正常情况下很短）        |
+| `all_waveforms`（各 chunk 拼接后的波形）      | `_worker` 函数退出                         | 整个请求                   |
+| `waveform`（最终大数组）+ result dict 引用    | `_worker` 退出后，消费端处理 result item 时      | 整个请求 + result item 消费前 |
+
+### 5.4 与跨请求内存增长的关系
+
+**这三个积累点不是跨请求内存增长的直接原因。** 它们的生命周期均被限制在单次 `_worker` 内，`_worker` 退出后 Python 层引用归零，GC 可以回收。
+
+跨请求内存只涨不降（日志里多次请求后 `proc_rss` / `sys_used` 持续走高）的真正原因是 **ORT Arena 高水位策略**（C++ 层行为，详见同目录 `app_onnx内存泄露.md` §5 / §7.3）：每次请求触达新的内存需求峰值时，Arena 向 OS 申请的内存块不会归还，永久保留为高水位。
+
+这三个积累点的实际影响是：**抬高单次请求内的 Python heap 峰值**，可能间接促使 ORT Arena 在更高的并发内存压力下申请更大块，从而间接推高高水位；但它们本身不构成跨请求泄漏。
