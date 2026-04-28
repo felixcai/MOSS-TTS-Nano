@@ -469,3 +469,39 @@ self.codec_streaming_session.reset()
 **影响：** 第一次 `synthesize_stream` 请求的 codec 流式解码阶段（`_decode_pending` → `codec_streaming_session.run_frames`）会触发 `codec_decode_step` 的首次 JIT 编译 / Arena 预分配，产生额外的首帧延迟。后续请求不受影响。
 
 所有 Session 共用同一个 `OrtCpuRuntime` 实例内的 ORT Arena 内存池，因此非流式 warmup 对 TTS prefill/decode 部分的 Arena 预分配是有效的，遗漏的只有 `codec_decode_step` 这一个 Session。
+
+---
+
+## 7 单实例、串行处理设计
+
+`OnnxRequestRuntimeManager` 在整个服务生命周期内只维护一个 `OnnxNanoTTSServiceAdapter` 实例（`default_runtime`）。`_build_runtime_locked` 无论请求传入何种 `cpu_threads` 参数，始终返回同一个实例：
+
+```python
+def _build_runtime_locked(self, cpu_threads: int) -> OnnxNanoTTSServiceAdapter:
+    if cpu_threads != self.default_runtime.thread_count:
+        logging.warning(
+            "OnnxRequestRuntimeManager: ignoring cpu_threads=%d (default=%d) "
+            "to avoid loading a second ONNX session; reusing default runtime.",
+            ...
+        )
+    return self.default_runtime   # 始终返回同一实例
+```
+
+`_execution_lock` 在 `_locked_runtime` 的 `with` 块中持有，生命周期覆盖整个 `iter_with_runtime` 迭代过程（即一次完整的 stream generate 请求从开始到最后一帧 yield 完毕）。多个并发请求的实际执行时序如下：
+
+```
+用户A 请求 ──→ 获得 _execution_lock ──→ 推理中（数秒至数十秒）
+                                              ↓ 完成后释放锁
+用户B 请求 ──→ 阻塞等待 _execution_lock ──────→ 才能开始推理
+用户C 请求 ──→ 阻塞等待 _execution_lock ────────────────────→ 再等
+```
+
+**这是有意为之的设计，而非缺陷。** 原因是当前 runtime 对象内存在以下共享可变状态，无法安全地被多个并发请求同时使用：
+
+| 共享状态                                | 位置              | 并发时的问题                                       |
+| ----------------------------------- | --------------- | -------------------------------------------- |
+| `codec_streaming_session`（KV Cache） | `OrtCpuRuntime` | 不同请求的逐帧解码会互相覆盖 KV Cache                      |
+| `manifest["generation_defaults"]`   | `OrtCpuRuntime` | `_apply_generation_options` 写入的温度、采样模式等会互相覆盖 |
+| `self.runtime.rng`                  | `OrtCpuRuntime` | 随机数种子被后来请求覆盖，影响采样结果                          |
+
+若要支持真正的并发，需要为每个并发槽位创建独立的 runtime 实例（或至少独立的 `codec_streaming_session` + 独立的配置副本），当前代码的 `_cpu_runtimes: dict[int, OnnxNanoTTSServiceAdapter]` 字典结构为此预留了扩展空间，但实际未实现。
