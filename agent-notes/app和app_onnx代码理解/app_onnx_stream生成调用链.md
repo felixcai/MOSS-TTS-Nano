@@ -298,3 +298,174 @@ output_path = _write_waveform_to_wav(...)      # 内部还产生 clipped + pcm16
 跨请求内存只涨不降（日志里多次请求后 `proc_rss` / `sys_used` 持续走高）的真正原因是 **ORT Arena 高水位策略**（C++ 层行为，详见同目录 `app_onnx内存泄露.md` §5 / §7.3）：每次请求触达新的内存需求峰值时，Arena 向 OS 申请的内存块不会归还，永久保留为高水位。
 
 这三个积累点的实际影响是：**抬高单次请求内的 Python heap 峰值**，可能间接促使 ORT Arena 在更高的并发内存压力下申请更大块，从而间接推高高水位；但它们本身不构成跨请求泄漏。
+
+---
+
+# `app_onnx.py` 函数调用分类（仅初始化和 Stream Generate 调用链视角）
+
+以下分类对应 `app_onnx.py` 中各函数在 **服务初始化** 和 **ONNX 流式生成（stream generate）** 两条路径上的角色：
+
+- **调用链入口**：被其他文件（`app.py`）直接调用，进入本文件的函数
+- **调用链内部**：仅在本文件内部（或闭包内部）被其他函数调用，支撑入口函数完成工作
+- **非调用链-初始化**：仅在服务启动 / 初始化 / 预热阶段调用，不在任何 per-request 路径上
+- **非调用链**：存在于代码中但不在 stream generate 路径上（专属非流式路径、UI 渲染或纯接口兼容）
+
+---
+
+## 1 调用链入口函数（被其他文件调用）
+
+| 函数                                            | 调用方                                                                   | 说明                                                                                                                                                              |
+| --------------------------------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OnnxNanoTTSServiceAdapter.__init__`          | `main()`（本文件启动时）                                                      | 创建唯一的 ONNX 适配器实例；内部创建 `OnnxTtsRuntime`，进而创建全部 ONNX InferenceSession 和 `CodecStreamingDecodeSession`                                                             |
+| `OnnxRequestRuntimeManager.iter_with_runtime` | `app.py` 的 `_run_streaming_job`（每次 stream 请求）                         | **app.py 进入本文件的真正入口**；通过 `_locked_runtime` 获取运行时实例和排他执行锁，在内部执行 `factory(runtime)` 触发 `synthesize_stream`，并将每个 yield item 逐一转发给调用方                               |
+| `OnnxNanoTTSServiceAdapter.synthesize_stream` | `iter_with_runtime` 内部的 `factory(runtime)`（`factory` 闭包由 `app.py` 传入） | **stream generate 推理入口**；虽然机械调用方是同文件的 `iter_with_runtime`，但触发它的 `factory` 闭包定义在 `app.py` 中，实质上仍属于跨文件驱动；使用 `threading.Thread + queue.Queue` 将推理线程与上层 yield 生成器解耦 |
+
+`app.py` 并不直接调用 `synthesize_stream`，而是将 `factory` 闭包传入 `iter_with_runtime`，完整调用路径如下：
+
+```
+app.py  _run_streaming_job
+    ↓ 调用
+OnnxRequestRuntimeManager.iter_with_runtime(factory=<闭包>)
+    ↓ 在内部执行 factory(runtime)，factory 是 app.py 传进来的闭包，
+      闭包内容是 runtime.synthesize_stream(...)
+OnnxNanoTTSServiceAdapter.synthesize_stream(...)
+```
+
+---
+
+## 2 调用链内部函数（仅文件内部调用）
+
+### 2.1 `OnnxNanoTTSServiceAdapter` 成员方法
+
+| 函数                          | 调用方                                   | 说明                                                                                                               |
+| --------------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `_apply_generation_options` | `synthesize_stream._worker`           | 将本次请求的推理超参数（`sample_mode`、温度、`top_p/k` 等）写入 `runtime.manifest["generation_defaults"]`，供 `ort_cpu_runtime` 在推理时读取 |
+| `_resolve_sample_mode`      | `_apply_generation_options`、`_worker` | 将外部传入的 `sample_mode / do_sample` 组合规范化为 `"greedy"` / `"fixed"` / `"full"` 三种枚举值                                  |
+| `_format_result_payload`    | `synthesize_stream._worker` 末尾        | 将完整生成结果打包为 result event dict（wav 路径、完整波形、耗时等元数据），发送给 `app.py` 消费                                                 |
+
+### 2.2 `synthesize_stream` 内部闭包（按调用顺序）
+
+| 闭包函数              | 调用方                                                      | 说明                                                                                                                                       |
+| ----------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `_safe_put`       | `_worker`、`_emit_waveform`                               | 线程安全地将 item 放入 `event_queue`；队列满时自旋等待（最多 0.5 s/次），收到停止信号后静默丢弃并返回 `False`                                                                 |
+| `_worker`         | `threading.Thread`（在 `synthesize_stream` 中启动）            | 在独立线程中执行全部推理工作：解析超参数 → 编码 Prompt → 切分文本 → 逐 chunk prefill/decode → codec 解码 → 音频入队 → 写 WAV → 发送 result                                   |
+| `_emit_waveform`  | `_decode_pending`（正常音频）、`_worker`（停顿静音）                  | 将一段已解码的 PCM 波形发送给上层消费者；追踪 `emitted_samples_total` 以计算 `lead_seconds`（音频超前播放量）                                                            |
+| `_decode_pending` | `_on_frame`（force=False）、`_worker` chunk 结束时（force=True） | 将 `pending_decode_frames` 中积累的声学 token 批量送入 `codec_streaming_session.run_frames` 解码为 PCM；`force=False` 时按动态预算批处理，`force=True` 时强制处理所有剩余帧 |
+| `_on_frame`       | `ort_cpu_runtime.generate_audio_frames`（每生成一帧 token 触发）  | 将新帧追加到 `pending_decode_frames` 缓冲，并以非强制模式尝试批量解码                                                                                          |
+
+### 2.3 `OnnxRequestRuntimeManager` 成员方法
+
+| 函数                      | 调用方                                     | 说明                                                                                           |
+| ----------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `_locked_runtime`       | `iter_with_runtime`、`call_with_runtime` | 解析 `cpu_threads` → 构建/获取运行时 → 持有 `_execution_lock`（保证同一时刻只有一个推理任务在运行）                        |
+| `_resolve_cpu_threads`  | `_locked_runtime`                       | 将外部传入的 `cpu_threads` 参数规范化为有效正整数                                                             |
+| `_build_runtime_locked` | `_locked_runtime`                       | 在已持有 `_lock` 的情况下返回目标运行时；当前实现始终复用 `default_runtime`，忽略 `cpu_threads` 差异以避免加载第二个 ONNX Session |
+
+### 2.4 模块级辅助函数
+
+| 函数            | 调用方                                                                       | 说明                                                |
+| ------------- | ------------------------------------------------------------------------- | ------------------------------------------------- |
+| `_log_memory` | `_worker`（start / chunk N done / finally exit 三处）、`_build_runtime_locked` | 记录进程 RSS 和系统内存用量，用于追踪 stream generate 过程中的内存阶梯式变化 |
+
+---
+
+## 3 非调用链-初始化函数（服务启动 / 预热阶段调用）
+
+| 函数/类                               | 调用方                                  | 说明                                                                                                                              |
+| ---------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `_CpuDeviceInfo`                   | `OnnxNanoTTSServiceAdapter.__init__` | 在初始化时实例化，填充 `self.device` 属性以兼容 `app.py` 对 `runtime.device.type` 的访问                                                            |
+| `OnnxNanoTTSServiceAdapter.warmup` | `app.py` 的 `WarmupManager`（服务启动后触发）  | 触发一次完整的非流式推理，目的是让 ONNX Session 完成首次 JIT 编译 / Arena 预分配，降低首请求冷启动延迟                                                               |
+| `_render_index_html_onnx`          | `app.py`（用户访问首页 `GET /` 时）           | 将 ONNX 版本的 UI 差异注入前端页面（标题、采样模式下拉框、disabled 样式等）；函数本身在 `main()` 中通过 `legacy_app._render_index_html = _render_index_html_onnx` 注入 |
+| `parse_args`                       | `main()`（启动时调用一次）                    | 解析 CLI 启动参数（`--model-dir`、`--host`、`--port`、`--cpu-threads` 等）                                                                  |
+| `main`                             | `__main__`（命令行直接运行）                  | 程序入口：解析参数 → 创建运行时 → 启动预热 → 注入全局引用 → 启动 uvicorn 服务                                                                               |
+
+---
+
+## 4 非调用链函数（不在 stream generate 路径上）
+
+| 函数                                                               | 说明                                                                                                                                     |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `OnnxNanoTTSServiceAdapter.get_model`                            | 兼容接口，返回 `self`；stream generate / 非流式推理均不经过此方法                                                                                          |
+| `OnnxNanoTTSServiceAdapter.split_voice_clone_text`（适配器包装）        | 对 `runtime.split_voice_clone_text` 的公开包装，供 `app.py` 直接调用；stream generate 路径中 `_worker` 绕过此方法直接调用 `self.runtime.split_voice_clone_text` |
+| `OnnxNanoTTSServiceAdapter.synthesize`                           | 同步（非流式）合成路径，被 `app.py` 的非流式 `/api/generate` 接口调用；stream generate 使用 `synthesize_stream`                                                |
+| `OnnxRequestRuntimeManager.normalize_requested_execution_device` | 兼容接口，始终返回 `"cpu"`；`app.py` 在设备类型解析时可能调用                                                                                                |
+| `OnnxRequestRuntimeManager.is_dedicated_cpu_request`             | 兼容接口，始终返回 `False`；`app.py` 在设备路由判断时可能调用                                                                                                |
+| `OnnxRequestRuntimeManager.is_cpu_runtime_loaded`                | 状态查询接口，供 `app.py` 在初始化或健康检查时使用                                                                                                         |
+| `OnnxRequestRuntimeManager.resolve_runtime`                      | 兼容接口，始终返回 `(default_runtime, "cpu")`；stream generate 路径使用 `iter_with_runtime`                                                          |
+| `OnnxRequestRuntimeManager.call_with_runtime`                    | 同步（非流式）请求路径使用；stream generate 路径使用 `iter_with_runtime`                                                                                 |
+
+---
+
+## 5 stream generate 路径在本文件的完整调用树
+
+```
+app.py  _run_streaming_job
+  └─ OnnxRequestRuntimeManager.iter_with_runtime          [入口]
+       └─ _locked_runtime                                  [内部]
+            ├─ _resolve_cpu_threads                        [内部]
+            └─ _build_runtime_locked                       [内部]
+                 └─ _log_memory                            [内部]
+
+app.py  iter_with_runtime → factory(runtime)
+  └─ OnnxNanoTTSServiceAdapter.synthesize_stream          [入口]
+       ├─ _safe_put                                        [内部·闭包]
+       └─ _worker（threading.Thread）                      [内部·闭包]
+            ├─ _log_memory                                 [内部]
+            ├─ _resolve_sample_mode                        [内部]
+            ├─ _apply_generation_options                   [内部]
+            ├─ runtime.resolve_prompt_audio_codes          → onnx_tts_runtime.py
+            ├─ runtime.split_voice_clone_text              → onnx_tts_runtime.py
+            ├─ for chunk_index, chunk_text in text_chunks:
+            │    ├─ runtime.encode_text                    → onnx_tts_runtime.py
+            │    ├─ runtime.build_voice_clone_request_rows → ort_cpu_runtime.py
+            │    ├─ codec_streaming_session.reset          → ort_cpu_runtime.py
+            │    ├─ _emit_waveform                         [内部·闭包]
+            │    │    └─ _safe_put
+            │    ├─ _decode_pending                        [内部·闭包]
+            │    │    ├─ _resolve_stream_decode_frame_budget → ort_cpu_runtime.py
+            │    │    ├─ codec_streaming_session.run_frames  → ort_cpu_runtime.py
+            │    │    └─ _emit_waveform
+            │    ├─ _on_frame（回调，由 generate_audio_frames 触发）[内部·闭包]
+            │    │    └─ _decode_pending(force=False)
+            │    ├─ runtime.generate_audio_frames          → ort_cpu_runtime.py
+            │    ├─ _decode_pending(force=True)
+            │    ├─ codec_streaming_session.reset          → ort_cpu_runtime.py
+            │    ├─ _concat_waveforms                      → onnx_tts_runtime.py
+            │    ├─ _log_memory
+            │    └─ _emit_waveform（chunk 间静音停顿）
+            ├─ _concat_waveforms                           → onnx_tts_runtime.py
+            ├─ _write_waveform_to_wav                      → onnx_tts_runtime.py
+            ├─ _format_result_payload                      [内部]
+            └─ _safe_put（result event / error event / sentinel None）
+```
+
+---
+
+## 6 warmup 覆盖范围的遗漏点
+
+`OnnxNanoTTSServiceAdapter.warmup` 调用的是 `self.synthesize()`（非流式路径），而非 `self.runtime.warmup()`（`OrtCpuRuntime` 自带的底层预热）。两者对 ONNX Session 的覆盖范围不同：
+
+| ONNX Session                            | 路径              | `OnnxNanoTTSServiceAdapter.warmup` | `OrtCpuRuntime.warmup` |
+| --------------------------------------- | --------------- | ---------------------------------- | ---------------------- |
+| `prefill`                               | 两条路径共用          | ✅ 已预热                              | ✅ 已预热                  |
+| `local_cached_step` / `local_decoder` 等 | 两条路径共用          | ✅ 已预热                              | ✅ 已预热                  |
+| `codec_encode`                          | 两条路径共用          | ✅ 已预热                              | ✅ 已预热                  |
+| `codec_decode`（全量解码）                    | **仅非流式路径**      | ✅ 已预热                              | ✅ 已预热                  |
+| `codec_decode_step`（逐帧流式解码）             | **仅 stream 路径** | ❌ 未预热                              | ✅ 已预热                  |
+
+`OrtCpuRuntime.warmup` 在末尾显式执行了 `codec_streaming_session.run_frames`（第 519 行），覆盖了 `codec_decode_step` Session：
+
+```python
+# ort_cpu_runtime.py  warmup()
+empty_frames = [([0] * int(self.manifest["tts_config"]["n_vq"]))]
+self.decode_full_audio(empty_frames)            # 预热 codec_decode
+self.codec_streaming_session.reset()
+self.codec_streaming_session.run_frames(empty_frames)  # 预热 codec_decode_step
+self.codec_streaming_session.reset()
+```
+
+但 `OnnxNanoTTSServiceAdapter.warmup` 没有调用 `self.runtime.warmup()`，导致 **`codec_decode_step` Session 在服务启动后仍然是冷的**。（且这个代码，没有任何地方被调用到，是个死代码）
+
+**影响：** 第一次 `synthesize_stream` 请求的 codec 流式解码阶段（`_decode_pending` → `codec_streaming_session.run_frames`）会触发 `codec_decode_step` 的首次 JIT 编译 / Arena 预分配，产生额外的首帧延迟。后续请求不受影响。
+
+所有 Session 共用同一个 `OrtCpuRuntime` 实例内的 ORT Arena 内存池，因此非流式 warmup 对 TTS prefill/decode 部分的 Arena 预分配是有效的，遗漏的只有 `codec_decode_step` 这一个 Session。
