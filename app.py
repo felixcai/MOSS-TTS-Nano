@@ -50,6 +50,7 @@ class DemoEntry:
     text: str
 
 
+# [非调用链] 仅在 _build_app 启动时调用一次，加载演示条目元数据，与 ONNX 推理路径无关
 def _load_demo_entries() -> list[DemoEntry]:
     if not DEMO_METADATA_PATH.is_file():
         logging.warning("demo metadata file not found: %s", DEMO_METADATA_PATH)
@@ -105,6 +106,8 @@ def _load_demo_entries() -> list[DemoEntry]:
     return demo_entries
 
 
+# [非调用链-初始化] 被 app_onnx.py 的 main() 调用，将 VSCode proxy URI 解析为 FastAPI root_path；
+# 与 ONNX 推理请求路径无关，属于纯服务启动辅助函数
 def _resolve_vscode_root_path(vscode_proxy_uri: Optional[str], server_port: int) -> Optional[str]:
     if not vscode_proxy_uri:
         return None
@@ -153,6 +156,13 @@ class WarmupSnapshot:
         return self.state == "failed"
 
 
+# ============================================================
+# WarmupManager
+# [调用链入口·初始化] 被 app_onnx.py 的 main() 实例化并调用 start()，
+# 在服务启动阶段触发 ONNX Session 预热（JIT 编译 / Arena 预分配）。
+# 在 ONNX 模式下，constructor 接收的 runtime 实际类型为 OnnxNanoTTSServiceAdapter，
+# _run 内部会调用 runtime.get_model() 和 runtime.warmup() 触发非流式推理完成预热。
+# ============================================================
 class WarmupManager:
     def __init__(self, runtime: NanoTTSService, text_normalizer_manager: "WeTextProcessingManager | None" = None) -> None:
         self.runtime = runtime
@@ -210,6 +220,9 @@ class WarmupManager:
                 self._message = message
             self._error = error
 
+    # [调用链内部] 后台线程函数：依次触发模型加载、warmup 推理、文本正则化初始化；
+    # 在 ONNX 模式下 runtime.get_model() 返回 self（OnnxNanoTTSServiceAdapter 的兼容接口），
+    # runtime.warmup() 执行一次非流式合成来预热 prefill/decode/codec_encode ONNX Session
     def _run(self) -> None:
         try:
             self._set_state(state="running", progress=0.1, message="Loading Nano-TTS model.", error=None)
@@ -245,6 +258,16 @@ class WarmupManager:
 T = TypeVar("T")
 
 
+# ============================================================
+# RequestRuntimeManager
+# [调用链·被 ONNX 替换] 原始 PyTorch 版本的运行时管理器。
+# 在 ONNX 运行模式下，app_onnx.py 的 main() 通过以下方式完全替换此类：
+#   legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager
+# 之后 _build_app 内部的 runtime_manager = RequestRuntimeManager(runtime) 创建的
+# 实际上是 OnnxRequestRuntimeManager 实例。
+# 因此本类的方法在 ONNX 模式下均不执行，但其 iter_with_runtime / call_with_runtime
+# 接口定义了 _run_streaming_job 对 runtime_manager 的调用契约。
+# ============================================================
 class RequestRuntimeManager:
     def __init__(self, default_runtime: NanoTTSService) -> None:
         self.default_runtime = default_runtime
@@ -325,13 +348,10 @@ class RequestRuntimeManager:
                 if threads_changed:
                     torch.set_num_threads(previous_threads)
 
+    # [调用链·接口] stream generate 路径上被 _run_streaming_job 调用的核心接口；
+    # 在 ONNX 模式下此方法由 OnnxRequestRuntimeManager.iter_with_runtime 实现，
+    # 负责获取 runtime 实例 + 排他执行锁，并对 factory(runtime) 生成器的每个 yield item 转发
     def iter_with_runtime(
-        self,
-        *,
-        requested_execution_device: str | None,
-        cpu_threads: int | None,
-        factory: Callable[[NanoTTSService], Iterator[T]],
-    ) -> Iterator[tuple[T, str, int | None]]:
         runtime, execution_device = self.resolve_runtime(requested_execution_device)
         if runtime.device.type != "cpu":
             for item in factory(runtime):
@@ -352,6 +372,15 @@ class RequestRuntimeManager:
                     torch.set_num_threads(previous_threads)
 
 
+# ============================================================
+# StreamingJob / StreamingJobManager
+# [调用链内部·Stream Generate] stream generate 请求的状态容器与生命周期管理器。
+# 每次 POST /api/generate-stream/start 创建一个 StreamingJob 实例，
+# 贯穿整个请求生命周期（_run_streaming_job 写入 → 音频 API 读取 → close API 清理）。
+#   - audio_queue：_run_streaming_job 写入 PCM bytes，generate_stream_audio 消费
+#   - lock：保护所有状态字段的并发读写
+#   - is_closed：客户端主动关闭时设置，通知 _run_streaming_job 提前退出
+# ============================================================
 @dataclass
 class StreamingJob:
     stream_id: str
@@ -413,6 +442,8 @@ class StreamingJob:
             }
 
 
+# [调用链内部·Stream Generate] 管理全部 StreamingJob 的字典容器；
+# create/get/close/delete 分别在 generate_stream_start/status/close/result 中被调用
 class StreamingJobManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -448,6 +479,8 @@ class StreamingJobManager:
             return self._jobs.pop(stream_id, None)
 
 
+# [调用链内部] 被多处调用（generate_stream_start 预检 warmup、generate_stream_result 等），
+# 将 WarmupSnapshot 格式化为人类可读的状态文本
 def _warmup_status_text(snapshot: WarmupSnapshot) -> str:
     progress_pct = int(round(snapshot.progress * 100.0))
     if snapshot.failed:
@@ -457,6 +490,8 @@ def _warmup_status_text(snapshot: WarmupSnapshot) -> str:
     return f"Warmup in progress ({progress_pct}%): {snapshot.message}"
 
 
+# [调用链内部] 被 _run_streaming_job 处理 "result" event 时调用，
+# 将生成结果 dict 格式化为人类可读的运行状态文本（用于日志和前端展示）
 def _format_run_status(result: dict[str, object]) -> str:
     waveform_numpy = np.asarray(result["waveform_numpy"])
     sample_count = int(waveform_numpy.shape[0]) if waveform_numpy.ndim >= 1 else 0
@@ -493,6 +528,7 @@ def _format_run_status(result: dict[str, object]) -> str:
     )
 
 
+# [调用链内部] 被 generate_stream_status 调用，将 StreamingJob snapshot 格式化为状态文本
 def _format_stream_status(snapshot: dict[str, object]) -> str:
     if bool(snapshot.get("failed")):
         return f"Stream failed: {snapshot.get('error') or snapshot.get('run_status') or 'Unknown error'}"
@@ -503,6 +539,8 @@ def _format_stream_status(snapshot: dict[str, object]) -> str:
     return str(snapshot.get("run_status") or "Streaming...")
 
 
+# [调用链内部] 被 _run_streaming_job 的 audio event 处理中调用，
+# 将 app_onnx.py 返回的 0-based chunk_index 规范化为前端可直接使用的索引
 def _normalize_stream_chunk_index(
     raw_chunk_index: object,
     *,
@@ -538,6 +576,7 @@ def _normalize_stream_chunk_index(
     return None, normalized_base
 
 
+# [非调用链] 非流式路径（/api/generate）使用；stream generate 路径使用 _audio_to_pcm16le_bytes
 def _audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:
     audio_np = np.asarray(audio_array, dtype=np.float32)
     if audio_np.ndim == 1:
@@ -561,6 +600,8 @@ def _audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:
     return buffer.read()
 
 
+# [调用链内部] 被 _run_streaming_job 在处理每个 "audio" event 时调用，
+# 将 float32 waveform 转换为 PCM-s16le 裸字节流，写入 StreamingJob.audio_queue 供客户端消费
 def _audio_to_pcm16le_bytes(audio_array) -> bytes:
     audio_np = np.asarray(audio_array, dtype=np.float32)
     if audio_np.ndim == 1:
@@ -575,6 +616,7 @@ def _audio_to_pcm16le_bytes(audio_array) -> bytes:
     return audio_int16.tobytes()
 
 
+# [调用链内部] 被 generate_stream_result 调用，读取最终 WAV 文件并编码为 base64 返回给前端
 def _read_audio_file_base64(path_value: str | None) -> str:
     path_text = str(path_value or "").strip()
     if not path_text:
@@ -589,6 +631,7 @@ def _read_audio_file_base64(path_value: str | None) -> str:
         return ""
 
 
+# [调用链内部] 被 _run_streaming_job（清理临时上传文件）和 generate_stream_close（清理 WAV 文件）调用
 def _maybe_delete_file(path_value: str | None) -> None:
     if not path_value:
         return
@@ -598,6 +641,7 @@ def _maybe_delete_file(path_value: str | None) -> None:
         logging.warning("failed to remove temporary file: %s", path_value, exc_info=True)
 
 
+# [调用链内部] 被 generate_stream_start 调用，将前端表单中 "0"/"1"/"true" 等字符串规范化为 bool
 def _coerce_bool(value: str | None, default: bool) -> bool:
     if value is None:
         return default
@@ -609,6 +653,7 @@ def _coerce_bool(value: str | None, default: bool) -> bool:
     return default
 
 
+# [调用链内部] 被 _persist_uploaded_prompt_audio 调用，清理上传文件名中的路径分隔符
 def _sanitize_uploaded_prompt_filename(filename: str | None) -> str:
     base_name = Path(str(filename or "")).name.strip()
     if not base_name:
@@ -616,10 +661,12 @@ def _sanitize_uploaded_prompt_filename(filename: str | None) -> str:
     return base_name
 
 
+# [调用链内部] 被 _persist_uploaded_prompt_audio 调用，生成上传文件的展示名称
 def _format_uploaded_prompt_display_name(filename: str | None) -> str:
     return f"Uploaded: {_sanitize_uploaded_prompt_filename(filename)}"
 
 
+# [调用链内部] 被 _resolve_prompt_audio_request 调用，将用户上传的音频文件持久化到临时路径
 async def _persist_uploaded_prompt_audio(upload: UploadFile | None) -> tuple[str | None, str | None]:
     if upload is None:
         return None, None
@@ -657,6 +704,10 @@ async def _persist_uploaded_prompt_audio(upload: UploadFile | None) -> tuple[str
     return temp_path, _format_uploaded_prompt_display_name(original_filename)
 
 
+# [非调用链-初始化·被app_onnx替换] 默认的前端 HTML 渲染函数；
+# app_onnx.py 在 main() 中通过 legacy_app._render_index_html = _render_index_html_onnx
+# 替换此函数，将 ONNX 版本的 UI 差异注入前端页面（采样模式选项、标题等）；
+# 本函数与 ONNX 推理请求路径无关，属于页面渲染路径
 def _render_index_html(
     *,
     request: Request,
@@ -2170,6 +2221,15 @@ def _render_index_html(
     return template
 
 
+# ============================================================
+# _build_app
+# [调用链入口·初始化] 被 app_onnx.py 的 main() 调用，构建 FastAPI 应用实例，
+# 注册所有 HTTP 路由，并在内部闭包中持有 runtime_manager（ONNX 模式下为 OnnxRequestRuntimeManager 实例）。
+# app_onnx.py 在调用此函数之前，已完成以下注入：
+#   1. legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager  → 路由到 ONNX 运行时
+#   2. legacy_app._render_index_html = _render_index_html_onnx        → 替换 UI 渲染
+# 因此本函数内 RequestRuntimeManager(runtime) 实际构造 OnnxRequestRuntimeManager 实例
+# ============================================================
 def _build_app(
     runtime: NanoTTSService,
     warmup_manager: WarmupManager,
@@ -2182,6 +2242,9 @@ def _build_app(
     demo_entries = _load_demo_entries()
     demo_entries_by_id = {demo_entry.demo_id: demo_entry for demo_entry in demo_entries}
 
+    # [调用链内部·Stream Generate] 被 generate_stream_start 调用，
+    # 通过 runtime_manager.call_with_runtime 提前获取文本分块结果，
+    # 主要目的是将 text_chunks 写入 StreamingJob 以供前端实时展示当前播放位置
     def _resolve_voice_clone_text_chunks(
         *,
         text: str,
@@ -2208,6 +2271,7 @@ def _build_app(
         normalized_chunks = [str(chunk).strip() for chunk in chunks if str(chunk).strip()]
         return normalized_chunks or [normalized_text]
 
+    # [调用链内部] 被 _resolve_prompt_audio_request 调用，按 demo_id 查找预置参考音频条目
     def _resolve_demo_entry(demo_id: str) -> DemoEntry:
         normalized_demo_id = str(demo_id or "").strip()
         if not normalized_demo_id:
@@ -2217,6 +2281,8 @@ def _build_app(
             raise ValueError(f"Unknown demo_id: {normalized_demo_id}")
         return demo_entry
 
+    # [调用链内部·Stream Generate] 被 generate_stream_start 调用，
+    # 解析请求中的参考音频来源：优先使用用户上传的音频，否则从 demo_id 取预置音频
     async def _resolve_prompt_audio_request(
         *,
         demo_id: str,
@@ -2244,6 +2310,8 @@ def _build_app(
             None,
         )
 
+    # [调用链内部] 被 generate_stream_status 和 generate_stream_result 调用，
+    # 将 StreamingJob snapshot 中的 emitted/lead 秒数格式化为展示文本
     def _stream_metrics_text(snapshot: dict[str, object]) -> str:
         metrics = [
             f"state={snapshot['state']}",
@@ -2255,6 +2323,7 @@ def _build_app(
             metrics.append(f"first_audio={float(first_audio_latency):.2f}s")
         return " | ".join(metrics)
 
+    # [调用链内部] 被多处调用，格式化文本正则化状态文本用于前端展示
     def _text_normalization_status_text(snapshot: SharedTextNormalizationSnapshot | None) -> str:
         if snapshot is None:
             return "WeTextProcessing disabled."
@@ -2262,6 +2331,9 @@ def _build_app(
             return f"{snapshot.message} error={snapshot.error}"
         return snapshot.message
 
+    # [调用链内部·Stream Generate] 被 _stream_factory 闭包调用；
+    # 在 ONNX 模式下 runtime 始终为 CPU，此函数将 flash_attention_2 等 GPU 注意力实现
+    # 规范化为 ONNX CPU 兼容的 "eager"
     def _resolve_attn_for_runtime(selected_runtime: NanoTTSService, requested_attn: str) -> str:
         normalized = str(requested_attn or "model_default").strip().lower()
         if selected_runtime.device.type != "cpu":
@@ -2270,6 +2342,9 @@ def _build_app(
             return "eager"
         return requested_attn
 
+    # [调用链内部·Stream Generate] 被 _run_streaming_job 在处理 "audio" event 时调用；
+    # 将 PCM bytes 以阻塞方式写入 StreamingJob.audio_queue，
+    # 若队列满则自旋等待（每次 0.1s），job.is_closed 时直接返回
     def _put_stream_audio(job: StreamingJob, pcm_bytes: bytes) -> None:
         while True:
             with job.lock:
@@ -2281,6 +2356,19 @@ def _build_app(
             except queue.Full:
                 continue
 
+    # ============================================================
+    # _run_streaming_job
+    # [调用链内部·Stream Generate 核心] 由 generate_stream_start 创建后台线程执行；
+    # 负责完整的 stream generate 生产侧逻辑：
+    #   1. 构造 _stream_factory 闭包，封装对 runtime.synthesize_stream 的调用
+    #   2. 调用 runtime_manager.iter_with_runtime(factory=_stream_factory)
+    #      → 在 ONNX 模式下实际执行 OnnxRequestRuntimeManager.iter_with_runtime
+    #      → 持有 _execution_lock 保证串行，并 yield (event, device, threads) 三元组
+    #   3. 对每个 event 按类型处理：
+    #      - "audio" event：waveform → PCM bytes → _put_stream_audio 写入 audio_queue
+    #      - "result" event：格式化 run_status，写入 job.final_result，完成流程
+    #   4. 全程维护 RTF（实时率）统计：first/steady gen_time vs audio_duration
+    # ============================================================
     def _run_streaming_job(
         job: StreamingJob,
         *,
@@ -2311,6 +2399,10 @@ def _build_app(
                 job.state = "running"
                 job.run_status = f"Streaming realtime audio... exec={initial_execution_label}"
 
+            # [调用链内部] _stream_factory 闭包：封装对 runtime.synthesize_stream 的调用，
+            # 作为 factory 参数传入 iter_with_runtime；
+            # 在 ONNX 模式下 selected_runtime 为 OnnxNanoTTSServiceAdapter 实例，
+            # 调用其 synthesize_stream 方法启动推理线程 + 事件队列机制
             def _stream_factory(selected_runtime: NanoTTSService):
                 return selected_runtime.synthesize_stream(
                     text=text,
@@ -2343,6 +2435,13 @@ def _build_app(
             rtf_steady_audio_s_sum = 0.0
             rtf_audio_chunk_count = 0
 
+            # 核心消费循环：
+            # iter_with_runtime 在 ONNX 模式下由 OnnxRequestRuntimeManager 实现，
+            # 内部持有 _execution_lock（全局串行），并对 synthesize_stream 生成器的每个 event yield 转发。
+            # event 来自 app_onnx.py 的 synthesize_stream，分三种类型：
+            #   "audio"  → 包含一段已解码的 PCM waveform，需要立即写入 audio_queue 供客户端拉取
+            #   "result" → 推理完成后的汇总信息（wav 路径、耗时等元数据），写入 job.final_result
+            #   "error"  → 推理线程内异常，由 iter_with_runtime raise 为 RuntimeError，进入 except 分支
             for event, resolved_execution_device, resolved_cpu_threads in runtime_manager.iter_with_runtime(
                 requested_execution_device="cpu",
                 cpu_threads=cpu_threads,
@@ -2357,6 +2456,8 @@ def _build_app(
                             break
 
                     if event_type == "audio":
+                        # "audio" event：app_onnx.py 每解码一段 PCM 就 yield 一次
+                        # waveform_numpy 为 float32，需转换为 int16 PCM bytes 再写入队列
                         waveform_numpy = np.asarray(event["waveform_numpy"], dtype=np.float32)
                         pcm_bytes = _audio_to_pcm16le_bytes(waveform_numpy)
                         sample_rate = int(event["sample_rate"])
@@ -2408,6 +2509,9 @@ def _build_app(
                         continue
 
                     if event_type == "result":
+                        # "result" event：app_onnx.py 所有 chunk 处理完毕后 yield 一次，
+                        # 包含最终 WAV 路径、完整波形、耗时等元数据；
+                        # 写入 job.final_result 供 generate_stream_result 接口读取
                         formatted_result = dict(event)
                         formatted_result["execution_device"] = resolved_execution_device
                         formatted_result["prompt_audio_display_path"] = prompt_audio_display_path
@@ -2555,6 +2659,15 @@ def _build_app(
             filename=demo_entry.prompt_audio_path.name,
         )
 
+    # ============================================================
+    # [调用链·Stream Generate HTTP 入口] POST /api/generate-stream/start
+    # stream generate 调用链的 HTTP 入口：
+    #   1. 解析请求参数（文本、参考音频、推理超参数）
+    #   2. 检查 warmup 状态，如未就绪则等待
+    #   3. 提前调用 _resolve_voice_clone_text_chunks 获取 text_chunks 供前端展示
+    #   4. 创建 StreamingJob 并以后台线程启动 _run_streaming_job
+    #   5. 立即返回 stream_id 和轮询 URL，客户端异步拉取 audio/status/result
+    # ============================================================
     @app.post("/api/generate-stream/start")
     async def generate_stream_start(
         text: str = Form(...),
@@ -2621,6 +2734,8 @@ def _build_app(
             with job.lock:
                 job.prompt_audio_path = prompt_audio_display_path
                 job.text_chunks = list(text_chunks)
+            # 启动后台线程执行 _run_streaming_job，HTTP 请求立即返回 stream_id；
+            # 客户端随后异步轮询 audio/status/result 接口
             thread = threading.Thread(
                 target=_run_streaming_job,
                 kwargs={
@@ -2675,6 +2790,8 @@ def _build_app(
             _maybe_delete_file(prompt_audio_cleanup_path)
             raise
 
+    # [调用链·Stream Generate HTTP 接口] GET /api/generate-stream/{stream_id}/status
+    # 客户端轮询：返回当前 StreamingJob 的状态快照（state/run_status/chunk_index 等）
     @app.get("/api/generate-stream/{stream_id}/status")
     async def generate_stream_status(stream_id: str):
         job = stream_jobs.get(stream_id)
@@ -2685,6 +2802,9 @@ def _build_app(
         snapshot["stream_metrics"] = _stream_metrics_text(snapshot)
         return snapshot
 
+    # [调用链·Stream Generate HTTP 接口] GET /api/generate-stream/{stream_id}/audio
+    # 客户端（音频播放器）连接此接口，以 StreamingResponse 方式持续拉取 PCM-s16le 数据；
+    # _iter_audio 内部阻塞消费 StreamingJob.audio_queue，直到收到 sentinel None（推理完成）
     @app.get("/api/generate-stream/{stream_id}/audio")
     async def generate_stream_audio(stream_id: str):
         job = stream_jobs.get(stream_id)
@@ -2709,6 +2829,9 @@ def _build_app(
             },
         )
 
+    # [调用链·Stream Generate HTTP 接口] GET /api/generate-stream/{stream_id}/result
+    # 客户端在 state=done 后调用，获取最终 WAV base64 和完整元数据；
+    # 若 job.final_result 中只有 audio_path，则读取文件并转为 base64 后缓存，同时删除临时文件
     @app.get("/api/generate-stream/{stream_id}/result")
     async def generate_stream_result(stream_id: str):
         job = stream_jobs.get(stream_id)
@@ -2751,6 +2874,10 @@ def _build_app(
             "audio_base64": audio_base64_payload,
         }
 
+    # [调用链·Stream Generate HTTP 接口] POST /api/generate-stream/{stream_id}/close
+    # 客户端主动关闭（页面离开、用户取消）时调用；
+    # 设置 job.is_closed=True，向 audio_queue 注入 sentinel None 使 _run_streaming_job 提前退出，
+    # 并清理磁盘上的最终 WAV 文件
     @app.post("/api/generate-stream/{stream_id}/close")
     async def generate_stream_close(stream_id: str):
         job = stream_jobs.close(stream_id)
@@ -2766,6 +2893,8 @@ def _build_app(
         _maybe_delete_file(audio_cleanup_path)
         return snapshot
 
+    # [非调用链] 非流式（同步）合成接口 POST /api/generate；
+    # 完整推理完成后一次性返回结果，不在 ONNX stream generate 路径上
     @app.post("/api/generate")
     async def generate(
         text: str = Form(...),
@@ -2909,6 +3038,8 @@ def _build_app(
     return app
 
 
+# [非调用链-初始化·被app_onnx替换] 原始 app.py 入口函数，使用 PyTorch NanoTTSService；
+# 在 ONNX 运行模式下此函数不被调用，由 app_onnx.py 的 main() 替代
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="MOSS-TTS-Nano web demo")
     parser.add_argument("--checkpoint-path", "--checkpoint_path", dest="checkpoint_path", type=str, default=str(DEFAULT_CHECKPOINT_PATH))

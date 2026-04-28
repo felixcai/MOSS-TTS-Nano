@@ -505,3 +505,282 @@ def _build_runtime_locked(self, cpu_threads: int) -> OnnxNanoTTSServiceAdapter:
 | `self.runtime.rng`                  | `OrtCpuRuntime` | 随机数种子被后来请求覆盖，影响采样结果                          |
 
 若要支持真正的并发，需要为每个并发槽位创建独立的 runtime 实例（或至少独立的 `codec_streaming_session` + 独立的配置副本），当前代码的 `_cpu_runtimes: dict[int, OnnxNanoTTSServiceAdapter]` 字典结构为此预留了扩展空间，但实际未实现。
+
+---
+
+# `app.py` 函数调用分类（仅 ONNX 初始化和 Stream Generate 调用链视角）
+
+以下分类对应 `app.py` 中各函数/类在 **ONNX 服务初始化** 和 **流式生成（stream generate）** 两条路径上的角色。
+
+`app.py` 位于整个调用链的最顶层，它既被 `app_onnx.py` 的 `main()` 在启动阶段调用（`_build_app`、`WarmupManager`），也通过 FastAPI 接收用户的 HTTP 请求（`generate_stream_start` 等端点）。`app_onnx.py` 通过以下两处全局注入改变 `app.py` 的运行时行为：
+
+```python
+legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager   # 替换运行时管理器
+legacy_app._render_index_html    = _render_index_html_onnx     # 替换 UI 渲染函数
+```
+
+函数角色定义：
+
+- **调用链入口**：被 `app_onnx.py` 直接调用/注入，或作为 HTTP 入口被 FastAPI 框架触发
+- **调用链内部**：仅在本文件内被其他函数调用，支撑入口函数完成工作
+- **非调用链**：不参与 ONNX 初始化或 stream generate 请求路径
+
+---
+
+## 1 调用链入口（被 app_onnx.py 调用 / HTTP 触发）
+
+### 1.1 初始化阶段（被 app_onnx.py 的 `main()` 调用）
+
+| 函数 / 类                      | 调用方                                     | 说明                                                                                                                                                                        |
+| --------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_build_app`                | `app_onnx.py` `main()`                  | 构建 FastAPI 应用实例，注册全部路由；在调用前 `app_onnx.py` 已完成 `RequestRuntimeManager` 和 `_render_index_html` 的注入，因此内部 `RequestRuntimeManager(runtime)` 实际构造的是 `OnnxRequestRuntimeManager` |
+| `WarmupManager`（类）          | `app_onnx.py` `main()`（实例化 + `start()`） | 管理服务启动预热流程；ONNX 模式下 `_run` 内调用 `runtime.get_model()`（兼容接口，返回 `self`）和 `runtime.warmup()`（非流式推理，预热 prefill/decode/codec_encode ONNX Session）                               |
+| `_resolve_vscode_root_path` | `app_onnx.py` `main()`                  | 将 `VSCODE_PROXY_URI` 解析为 FastAPI `root_path`，属服务启动辅助，与推理路径无关                                                                                                              |
+
+### 1.2 Stream Generate 请求阶段（HTTP 端点，由 FastAPI/uvicorn 触发）
+
+| 端点函数                     | 路由                                            | 说明                                                                                                                                 |
+| ------------------------ | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `generate_stream_start`  | `POST /api/generate-stream/start`             | **stream generate 调用链的 HTTP 入口**；完成参数解析、warmup 检查、文本预分块后，创建 `StreamingJob` 并以后台线程启动 `_run_streaming_job`；立即返回 `stream_id` 和各轮询 URL |
+| `generate_stream_audio`  | `GET /api/generate-stream/{stream_id}/audio`  | 客户端（音频播放器）连接此接口，以 `StreamingResponse` 持续消费 `StreamingJob.audio_queue` 中的 PCM-s16le 字节流，直到收到 sentinel `None`                        |
+| `generate_stream_status` | `GET /api/generate-stream/{stream_id}/status` | 客户端轮询；返回当前 `StreamingJob` 的状态快照（`state`/`run_status`/`chunk_index` 等）                                                              |
+| `generate_stream_result` | `GET /api/generate-stream/{stream_id}/result` | 客户端在 `state=done` 后调用；返回最终 WAV base64 和完整元数据；包含 WAV 文件懒加载转 base64 逻辑                                                               |
+| `generate_stream_close`  | `POST /api/generate-stream/{stream_id}/close` | 客户端主动取消时调用；设置 `job.is_closed=True`，向 `audio_queue` 注入 sentinel `None` 通知 `_run_streaming_job` 提前退出                                 |
+
+---
+
+## 2 调用链内部（仅本文件内部调用）
+
+### 2.1 初始化支路（`WarmupManager._run`）
+
+| 函数                           | 调用方                                  | 说明                                                                                                  |
+| ---------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `WarmupManager._run`         | `WarmupManager.start`（后台线程）          | 依次调用 `runtime.get_model()` → `runtime.warmup()` → 文本正则化初始化；ONNX 模式下 `warmup()` 执行非流式推理完成 Session 预热 |
+| `WarmupManager._set_state`   | `WarmupManager._run`                 | 线程安全地更新 `state`/`progress`/`message` 字段                                                             |
+| `WarmupManager.snapshot`     | 多处                                   | 线程安全地读取当前 warmup 状态快照                                                                               |
+| `WarmupManager.ensure_ready` | `generate_stream_start`（warmup 未就绪时） | 阻塞等待 warmup 线程结束后返回最新快照                                                                             |
+
+### 2.2 Stream Generate 核心支路（`_run_streaming_job` 及其闭包）
+
+| 函数                                 | 调用方                                                         | 说明                                                                                                                                                            |
+| ---------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `_run_streaming_job`               | `generate_stream_start`（后台线程）                               | **stream generate 生产侧核心**：构造 `_stream_factory` 闭包 → 调用 `runtime_manager.iter_with_runtime` → 逐一消费 `event`（`"audio"` / `"result"`）→ PCM bytes 写入 `audio_queue` |
+| `_stream_factory`（闭包）              | `_run_streaming_job` 内部，作为 `factory` 传入 `iter_with_runtime` | 封装对 `runtime.synthesize_stream(...)` 的调用；ONNX 模式下 `runtime` 为 `OnnxNanoTTSServiceAdapter` 实例                                                                  |
+| `_put_stream_audio`                | `_run_streaming_job`（处理 `"audio"` event）                    | 以阻塞方式将 PCM bytes 写入 `StreamingJob.audio_queue`；队列满时自旋等待，`is_closed` 时静默丢弃                                                                                     |
+| `_resolve_voice_clone_text_chunks` | `generate_stream_start`                                     | 提前调用 `runtime_manager.call_with_runtime` 获取 text chunks，写入 `StreamingJob.text_chunks` 供前端实时展示当前播放位置                                                           |
+| `_resolve_prompt_audio_request`    | `generate_stream_start`                                     | 解析参考音频来源：优先用上传文件，否则从 `demo_id` 取预置音频                                                                                                                          |
+| `_resolve_attn_for_runtime`        | `_stream_factory` 闭包内                                       | 在 CPU 设备上将 `flash_attention_2` 等 GPU 注意力实现规范化为 `"eager"`                                                                                                      |
+
+### 2.3 辅助工具函数
+
+| 函数                                     | 调用方                                                          | 说明                                                   |
+| -------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------------- |
+| `_audio_to_pcm16le_bytes`              | `_run_streaming_job`（处理 `"audio"` event）                     | 将 float32 waveform 转换为 PCM-s16le 裸字节流                |
+| `_normalize_stream_chunk_index`        | `_run_streaming_job`（处理 `"audio"` event）                     | 将 `app_onnx.py` 返回的 0-based `chunk_index` 规范化为前端可用索引 |
+| `_format_run_status`                   | `_run_streaming_job`（处理 `"result"` event）                    | 将生成结果 dict 格式化为人类可读的运行状态文本                           |
+| `_format_stream_status`                | `generate_stream_status`                                     | 将 `StreamingJob` snapshot 格式化为状态文本                   |
+| `_warmup_status_text`                  | `generate_stream_start`（预检）、`generate_stream_result` 等       | 将 `WarmupSnapshot` 格式化为状态文本                          |
+| `_read_audio_file_base64`              | `generate_stream_result`                                     | 读取最终 WAV 文件并编码为 base64                               |
+| `_maybe_delete_file`                   | `_run_streaming_job`（清理临时文件）、`generate_stream_close`（清理 WAV） | 安全删除临时文件                                             |
+| `_coerce_bool`                         | `generate_stream_start`                                      | 将表单字符串 `"0"/"1"/"true"` 规范化为 `bool`                  |
+| `_resolve_demo_entry`                  | `_resolve_prompt_audio_request`                              | 按 `demo_id` 查找预置参考音频条目                               |
+| `_persist_uploaded_prompt_audio`       | `_resolve_prompt_audio_request`                              | 将用户上传的音频文件持久化到临时路径                                   |
+| `_sanitize_uploaded_prompt_filename`   | `_persist_uploaded_prompt_audio`                             | 清理上传文件名中的路径分隔符                                       |
+| `_format_uploaded_prompt_display_name` | `_persist_uploaded_prompt_audio`                             | 生成上传文件的展示名称                                          |
+
+### 2.4 `StreamingJob` / `StreamingJobManager`
+
+| 类 / 方法                    | 说明                                                                                                                           |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `StreamingJob`（dataclass） | stream generate 请求的状态容器，贯穿整个请求生命周期；`audio_queue` 连接 `_run_streaming_job`（写）与 `generate_stream_audio`（读）；`is_closed` 是客户端取消信号 |
+| `StreamingJobManager`     | 管理全部 `StreamingJob` 的字典容器；`create` / `get` / `close` / `delete` 分别被各 HTTP 端点调用                                               |
+
+---
+
+## 3 非调用链函数（不参与 ONNX 初始化或 stream generate 请求路径）
+
+| 函数                          | 说明                                                                                           |
+| --------------------------- | -------------------------------------------------------------------------------------------- |
+| `_load_demo_entries`        | 仅在 `_build_app` 启动时调用一次，加载演示条目元数据，与推理路径无关                                                    |
+| `_render_index_html`        | 默认前端 HTML 渲染函数；ONNX 模式下被 `app_onnx.py` 替换为 `_render_index_html_onnx`，本函数不再被调用                |
+| `_audio_to_wav_bytes`       | 仅非流式路径（`/api/generate`）使用；stream generate 路径使用 `_audio_to_pcm16le_bytes`                     |
+| `generate`（`/api/generate`） | 非流式（同步）合成接口，完整推理完成后一次性返回结果；不在 stream generate 路径上                                            |
+| `main`                      | 原始 PyTorch 版本的程序入口；ONNX 模式下由 `app_onnx.py` 的 `main()` 替代，此函数不被调用                             |
+| `index`（`GET /`）            | 首页 HTML 渲染端点；ONNX 模式下调用已被替换的 `_render_index_html`（即 `_render_index_html_onnx`），属页面渲染路径，与推理无关 |
+
+---
+
+## 4 `RequestRuntimeManager`：被替换的运行时管理器
+
+`RequestRuntimeManager` 是 `app.py` 中定义的原始 PyTorch 版本运行时管理器。在 ONNX 运行模式下，`app_onnx.py` 的 `main()` 在调用 `_build_app` 之前执行了：
+
+```python
+legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager
+```
+
+因此 `_build_app` 内部的 `runtime_manager = RequestRuntimeManager(runtime)` 实际构造的是 `OnnxRequestRuntimeManager` 实例。`app.py` 中定义的 `RequestRuntimeManager` 类的所有方法在 ONNX 模式下均不执行，但其 `iter_with_runtime` / `call_with_runtime` 接口签名定义了 `_run_streaming_job` 对 `runtime_manager` 的调用契约。
+
+---
+
+## 5 stream generate 路径在本文件的完整调用树
+
+```
+[用户 HTTP 请求]
+  └─ generate_stream_start (POST /api/generate-stream/start)    [调用链入口·HTTP]
+       ├─ _resolve_prompt_audio_request                         [内部]
+       │    ├─ _resolve_demo_entry                              [内部]
+       │    └─ _persist_uploaded_prompt_audio                   [内部]
+       │         └─ _sanitize_uploaded_prompt_filename          [内部]
+       ├─ _resolve_voice_clone_text_chunks                      [内部]
+       │    └─ runtime_manager.call_with_runtime → OnnxRequestRuntimeManager
+       └─ threading.Thread(target=_run_streaming_job).start()
+
+_run_streaming_job（后台线程）                                    [内部·核心]
+  ├─ _stream_factory（闭包）                                    [内部]
+  │    └─ runtime.synthesize_stream → app_onnx.py
+  ├─ runtime_manager.iter_with_runtime(factory=_stream_factory) → OnnxRequestRuntimeManager
+  │    └─ (yield event, device, threads)
+  ├─ for event in iter_with_runtime:
+  │    ├─ event_type == "audio":
+  │    │    ├─ _audio_to_pcm16le_bytes                          [内部]
+  │    │    ├─ _normalize_stream_chunk_index                    [内部]
+  │    │    └─ _put_stream_audio → job.audio_queue              [内部]
+  │    └─ event_type == "result":
+  │         └─ _format_run_status → job.final_result            [内部]
+  └─ finally: _maybe_delete_file（临时文件清理）                 [内部]
+
+[客户端轮询]
+  ├─ generate_stream_audio  (GET /audio)   消费 job.audio_queue [调用链入口·HTTP]
+  ├─ generate_stream_status (GET /status)  读取 job.snapshot()  [调用链入口·HTTP]
+  ├─ generate_stream_result (GET /result)  读取 job.final_result [调用链入口·HTTP]
+  │    └─ _read_audio_file_base64                               [内部]
+  └─ generate_stream_close  (POST /close)  设置 job.is_closed   [调用链入口·HTTP]
+       └─ _maybe_delete_file（WAV 文件清理）                    [内部]
+```
+
+---
+
+## 6 `app_onnx.py` 与 `app.py` 的关系：替换注入模式
+
+### 核心思路
+
+`app_onnx.py` 是一个**"适配器启动器"**，`app.py` 是**通用的 Web 层框架**。`app_onnx.py` 仅在启动时对 `app.py` 做两次全局注入，然后把整个 HTTP 路由框架原封不动地复用。`app.py` 的路由逻辑（流控、RTF 统计、`StreamingJob` 管理等）对 ONNX 和 PyTorch 两条路径完全共用，无需重复实现。
+
+### 五步启动过程
+
+**① 创建 ONNX 专属运行时**
+
+`app_onnx.py` 创建 `OnnxNanoTTSServiceAdapter`，内部初始化全部 ONNX InferenceSession。这是 `app.py` 中 `NanoTTSService`（PyTorch 版）的 ONNX 替代品。
+
+**② 替换 `app.py` 中的两个全局对象**
+
+```python
+legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager   # 替换运行时管理器类
+legacy_app._render_index_html    = _render_index_html_onnx     # 替换 HTML 渲染函数
+```
+
+这两行是整个注入机制的关键。Python 的模块对象是可变的，直接对模块属性赋值即可替换 `app.py` 模块命名空间里的名字，无需修改 `app.py` 的任何代码。
+
+**③ 调用 `_build_app` 把构建控制权交给 `app.py`**
+
+```python
+app = legacy_app._build_app(runtime, warmup_manager, ...)
+```
+
+`_build_app` 内部有一行：
+
+```python
+runtime_manager = RequestRuntimeManager(runtime)
+```
+
+因为第②步已经替换了 `RequestRuntimeManager`，这里实际构造的是 `OnnxRequestRuntimeManager` 实例，而非原来的 `RequestRuntimeManager`。
+
+**④ `app.py` 的路由代码完全不变，行为已被替换**
+
+`_build_app` 注册的所有路由（`generate_stream_start`、`_run_streaming_job` 等）代码一行没动。但运行时 `_run_streaming_job` 调用 `runtime_manager.iter_with_runtime` 时，走的是 `OnnxRequestRuntimeManager` 的 ONNX 实现，最终进入 `OnnxNanoTTSServiceAdapter.synthesize_stream`。
+
+**⑤ `uvicorn.run(app)` 启动服务**
+
+控制权最终交给 uvicorn，`app.py` 的全部路由接管所有 HTTP 请求。
+
+### 总结示意
+
+```
+app_onnx.py  main()
+  │
+  ├─ [1] 创建 OnnxNanoTTSServiceAdapter（含全部 ONNX Session）
+  │
+  ├─ [2] 注入 app.py 模块命名空间：
+  │       legacy_app.RequestRuntimeManager = OnnxRequestRuntimeManager
+  │       legacy_app._render_index_html    = _render_index_html_onnx
+  │
+  ├─ [3] legacy_app._build_app(runtime, ...)
+  │         └─ 内部构造 runtime_manager = RequestRuntimeManager(runtime)
+  │              ↑ 此时 RequestRuntimeManager 已是 OnnxRequestRuntimeManager
+  │
+  ├─ [4] app.py 路由代码不变，运行时行为已被替换
+  │         _run_streaming_job → runtime_manager.iter_with_runtime
+  │                               → OnnxRequestRuntimeManager（ONNX 实现）
+  │                                  → OnnxNanoTTSServiceAdapter.synthesize_stream
+  │
+  └─ [5] uvicorn.run(app)  → 服务启动，控制权交给 app.py 路由层
+```
+
+---
+
+# ORT Arena 与 PyTorch 内存管理机制对比
+
+## 1 ORT Arena 是什么
+
+ORT Arena（全称 `BFCArena` / `AllocatorArena`）是 ONNX Runtime 内部 C++ 层的**内存池**。核心策略：
+
+- 向 OS 申请内存时，按"高水位"永久保留，不归还
+- 目的是避免频繁的 `malloc`/`free` 系统调用，提升推理速度
+- 完全在 C++ 层运行，Python GC 看不见、管不了
+
+## 2 PyTorch 有类似机制吗
+
+有，但不同场景下行为差异很大：
+
+**GPU：CUDA Caching Allocator**
+PyTorch 在 GPU 上有自己的显存缓存池，行为与 ORT Arena 非常相似——向 CUDA 申请的显存不会立刻归还给 OS，而是缓存在 PyTorch 内部。这是 GPU 场景"显存只涨不降"的来源。可通过 `torch.cuda.empty_cache()` 手动触发归还。
+
+**CPU：依赖系统 malloc**
+PyTorch 在 CPU 上默认直接调用系统 `malloc`（通常走 `glibc malloc` / `jemalloc` / `tcmalloc`），**没有自己的 CPU 内存池**。
+
+## 3 "依赖系统 malloc"不等于"用完立刻还给 OS"
+
+PyTorch CPU 张量释放时，有两层：
+
+**第一层（PyTorch 自身）**：张量引用归零 → Python 立刻调用底层 `free()` → 内存返还给 malloc 库。这一步做到了"用完就还"。
+
+**第二层（malloc 库）**：`free()` 并不等于把内存还给 OS，而是还给 malloc 库的内部空闲链表：
+
+```
+PyTorch 调用 free(ptr)
+    → malloc 库收回这块内存，放进"空闲池"
+    → 下次 malloc() 优先从空闲池取，不再向 OS 申请
+    → OS 不一定能立刻看到内存下降（RSS 有延迟）
+```
+
+但 malloc 库和 ORT Arena 有本质区别：malloc 库长期闲置的内存最终会通过 `madvise`/`munmap` 归还给 OS；ORT Arena 则永不归还。
+
+## 4 三种情况对比
+
+|               | ORT Arena（ONNX Runtime CPU） | PyTorch CUDA Caching Allocator | PyTorch CPU（系统 malloc） |
+| ------------- | --------------------------- | ------------------------------ | ---------------------- |
+| 有内存池          | ✅                           | ✅                              | ❌（依赖系统 malloc）         |
+| 高水位策略         | ✅                           | ✅                              | —                      |
+| Python 层可手动释放 | ❌ 基本不行                      | ✅ `torch.cuda.empty_cache()`   | —                      |
+| 空闲内存能否归还 OS   | ❌ 永不归还                      | ❌（除非手动 empty_cache）            | ✅ 库空闲超阈值后自动归还          |
+| 跨请求 RSS 只涨不降  | ✅（本项目遇到的问题）                 | ✅（GPU 场景常见）                    | 基本不会，最终会回落             |
+| 进程退出时释放       | ✅                           | ✅                              | ✅                      |
+
+## 5 本项目的实际影响
+
+- **ONNX 模式（ORT Arena）**：每次请求触达新的内存需求峰值时，Arena 向 OS 申请的内存块永久保留。多次请求后 `proc_rss` 持续走高，直到达到历史峰值后趋于稳定。
+- **PyTorch CPU 模式**：推理结束 → 张量释放 → `free()` 归还给 malloc 库 → malloc 库视情况归还 OS。RSS 可能有短暂延迟，但最终会回落，不会出现类似问题。
+
+## 6 一句话总结
+
+PyTorch CPU 是"用完还给 malloc 库，malloc 库视情况还给 OS"，是**软性持有**，内存最终能回落；ORT Arena 是"用完自己攥着不撒手"，是**硬性持有**，RSS 永远不降。
