@@ -783,6 +783,8 @@ class OrtCpuRuntime:
         # 每个 VQ 声道分别维护历史 token 列表和集合，用于重复惩罚计算
         previous_tokens_by_channel = [[] for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
         previous_token_sets_by_channel = [set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
+        # 记录最后一次 decode step 的输入，用于循环结束后的 Arena 收缩空跑
+        _last_decode_feeds: dict[str, np.ndarray] | None = None
 
         for step_index in range(int(generation_defaults["max_new_frames"])):
             frame: list[int] = []
@@ -927,6 +929,7 @@ class OrtCpuRuntime:
             }
             for input_name in self.tts_meta["onnx"]["decode_input_names"][2:]:
                 decode_feeds[input_name] = past_by_name[input_name]
+            _last_decode_feeds = decode_feeds
             decode_outputs = self.sessions["decode"].run(None, decode_feeds)
             decode_output_names = [output.name for output in self.sessions["decode"].get_outputs()]
             named_decode_outputs = dict(zip(decode_output_names, decode_outputs, strict=True))
@@ -941,6 +944,16 @@ class OrtCpuRuntime:
             # app_onnx.py 的 _on_frame 在此被调用，收集足够帧后调用 codec 流式解码
             if on_frame is not None:
                 on_frame(generated_frames, step_index, frame)
+
+        # ── text_chunk 生成结束：执行一次带 Shrinkage 的收缩空跑 ─────────────
+        # Decode 循环产生了大量大小不断变化的 KV Cache 张量，导致 GPU Arena 碎片化。
+        # 在整个 chunk 结束后统一执行一次 Shrinkage，让 Arena 归还末尾的空闲块给系统，
+        # 而不是在每帧后都触发（会严重拖慢推理速度）。
+        if _last_decode_feeds is not None:
+            _shrink_run_options = ort.RunOptions()
+            _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+            self.sessions["decode"].run(None, _last_decode_feeds, run_options=_shrink_run_options)
+
         return generated_frames
 
 __all__ = [
