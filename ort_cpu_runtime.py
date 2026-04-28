@@ -431,6 +431,10 @@ class OrtCpuRuntime:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         options.intra_op_num_threads = self.thread_count
         options.inter_op_num_threads = 1
+
+        # 禁用 CPU 内存 Arena，内存用完即还给系统
+        options.enable_cpu_mem_arena = False
+
         # return ort.InferenceSession(str(path_value), sess_options=options, providers=["CPUExecutionProvider"])
         return ort.InferenceSession(str(path_value), sess_options=options, providers=["CUDAExecutionProvider"])
 
