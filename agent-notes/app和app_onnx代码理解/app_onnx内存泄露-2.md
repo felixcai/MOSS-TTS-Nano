@@ -160,28 +160,68 @@ cuda_provider_options = {
         # 1. 彻底禁用 CPU 内存 Arena，内存用完即还给系统
         options.enable_cpu_mem_arena = False
 
-        # 2. 禁止将模型权重分配到 GPU Arena 中，防止 Arena 被权重绑架无法释放
-        options.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
+        # 2. (已废弃) 禁止将模型权重分配到 GPU Arena 中
+        # options.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
 
-        # 3. 严格配置 CUDA Execution Provider 的内存策略
-        cuda_provider_options = {
-            # 拒绝 Arena 按 2 的指数倍激进暴涨，改为“按需申请”
-            "arena_extend_strategy": "kSameAsRequested",
-            # 可选：硬性限制每个 Session 的 GPU 内存上限（例如 2GB），防止单个 Session 撑爆 Orin 内存
-            # "gpu_mem_limit": 2 * 1024 * 1024 * 1024,
-        }
+        # 3. (已废弃) 严格配置 CUDA Execution Provider 的内存策略
+        # cuda_provider_options = {
+        #     "arena_extend_strategy": "kSameAsRequested",
+        # }
 
         return ort.InferenceSession(
             str(path_value), 
             sess_options=options, 
-            providers=[("CUDAExecutionProvider", cuda_provider_options)]
+            providers=["CUDAExecutionProvider"]
         )
 ```
+
+## ⚠️ 严重警告：为什么放弃第 2 点和第 3 点？（14GB 内存暴涨之谜）
+
+在实际测试中，同时开启第 2 点和第 3 点会导致 GPU 内存瞬间飙升至 14GB 甚至 15GB 最终 OOM。原因如下：
+
+**1. 为什么放弃第 2 点（剥离权重）？**
+在 MOSS-TTS-Nano 的架构中，代码一口气创建了 6~8 个独立的 `InferenceSession`（`prefill`, `decode`, `local_decoder` 等）。
+
+* **默认行为（权重进入 Arena）**：虽然每个 Session 都有权重副本，但在同一个 Arena 内存池中，整体膨胀是受控的（约 3GB）。
+* **剥离权重后**：每个 Session 都会**独立、毫无节制地**调用底层的 `cudaMalloc` 来加载权重。由于 `prefill` 和 `decode` 包含大量重复的 Transformer 权重，这导致同一份权重在显存中被硬生生复制了 6~8 份，瞬间撑爆显存（14GB）。
+
+**2. 为什么放弃第 3 点（kSameAsRequested）？**
+在 Decode 阶段，音频是一帧一帧生成的，KV Cache 的张量大小在**每一步都在动态变化**（比如 100, 101, 102...）。
+
+* **kSameAsRequested**：强迫 Arena 每次都去切出极其精确的内存块。这导致不同步骤、不同请求之间的内存块**完全无法互相复用**。Arena 内部迅速产生海量碎片，只能无限向 GPU 申请新内存，导致内存像阶梯一样逐步上涨到 15GB。
+* **默认的 kNextPowerOfTwo**：按 2 的指数倍扩展（如 128KB, 256KB）。虽然单个块浪费了一点空间，但这些“标准化尺寸”的块可以被完美复用，度过前期的碎片积累期后，内存增长会触顶停滞。
+
+**结论**：在不开启每次 Run 之后的 Shrinkage（收缩）的前提下，最稳妥的策略是**仅保留第 1 点（禁用 CPU Arena）**，让 GPU Arena 保持默认行为（权重进 Arena，按 2 的指数倍扩展）。
+
+---
 
 **为什么没有加 `memory.enable_memory_arena_shrinkage`？**
 因为已经彻底禁用了 CPU Arena，而 GPU 端的收缩策略需要修改每次 `session.run()` 的调用（传入 `RunOptions`），改动面太大。通过上述 3 点配置（尤其是 `kSameAsRequested` 和剥离权重），已经能将 GPU Arena 的膨胀压制到最低限度，通常足够解决 Jetson 上的 OOM 问题。
 
 ### 补充：如果要在 stream generate 路径中开启 GPU Arena 收缩，需要改动哪些地方？
+
+**可以，但效果会大打折扣，甚至基本无效。**
+
+如果不开启第 2 点（剥离权重）和第 3 点（按需申请），仅在 `RunOptions` 中开启 `memory.enable_memory_arena_shrinkage`，会发生：
+
+1. **权重的“锚定”效应（最致命的问题）**
+   模型权重被分配在 GPU Arena 内存池中。当一次推理结束后调用 Shrinkage，Arena 会尝试把空闲的内存块还给操作系统。**但是**，Arena 只能归还**位于内存池末尾的连续空闲块**。如果一块空闲内存的旁边紧挨着活跃的模型权重，这块空闲内存就会被“卡住”，无法归还给系统。
+2. **默认的指数级暴涨依然存在**
+   不开启第 3 点，Arena 依然会按 2 的指数倍（`kNextPowerOfTwo`）申请显存。这种频繁的“暴涨 -> 收缩 -> 暴涨”会带来极大的性能开销，而且因为“锚定”效应，收缩往往是不彻底的。
+
+**最有效的做法是：**
+不需要在每一次微小的 `session.run`（比如每一帧的 `local_cached_step`）后都去调用 Shrinkage，因为那样会严重拖慢推理速度。
+你应该在**一个完整的 `text_chunk` 生成结束之后**（或者整个请求结束之后），调用一次带 Shrinkage 的空跑（或者在最后一次推理时带上 Shrinkage 参数），让 Arena 集中清理一下这一大段 Decode 过程中产生的垃圾。
+
+### 补充：如果要 GPU Arena 收缩，最主要就是在 Decode 阶段吗？
+
+**是的，最主要、最需要加的地方就是在 Decode 阶段。**
+
+1. **内存泄漏/碎片化的重灾区**：Decode 阶段（自回归生成）是一帧一帧进行的。每生成一帧，序列长度加 1，KV Cache 的大小就变大一点。这种**几百上千次连续的、大小不断变化的张量分配和释放**，是导致 GPU Arena 碎片化和内存无限制增长的罪魁祸首。
+2. **Prefill 阶段相对“干净”**：Prefill 阶段虽然会瞬间申请一块巨大的内存（用于计算全局 Attention），但它通常在一次请求中**只执行一次**。它申请了一块大内存，用完就释放了，行为非常规律，不容易产生大量细碎的碎片。
+3. **Codec 阶段也是一次性的**：无论是编码参考音频（`codec_encode`）还是最终的波形解码（`codec_decode`），通常也是一次性处理一个大块数据，不会像 Decode 阶段那样陷入死循环式的动态分配。
+
+因此，如果你要用 Shrinkage，目标就是清理 Decode 阶段留下的烂摊子。但再次强调，由于权重的锚定效应，即使你在 Decode 之后调用了 Shrinkage，它能回收的内存比例可能依然不理想。控制 `voice_clone_max_text_tokens` 依然是最根本、最有效的手段。
 
 在 MOSS-TTS-Nano 的流式生成链路中，ONNX Runtime 被拆分成了多个独立的 Session。你不能像 `SessionOptions` 那样在初始化时统一配置一次就一劳永逸，而是必须深入到 `ort_cpu_runtime.py` 和 `onnx_tts_runtime.py` 的**每一个执行具体推理的底层函数中**，手动实例化 `ort.RunOptions()` 并将其作为关键字参数显式传递给每一个 `session.run()` 调用。
 

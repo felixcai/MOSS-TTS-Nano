@@ -104,7 +104,11 @@ class OnnxNanoTTSServiceAdapter:
     # [非调用链-初始化] 服务启动后由 WarmupManager 触发一次完整的非流式推理，
     # 目的是让 ONNX Session 完成首次 JIT 编译 / Arena 预分配，降低首请求冷启动延迟
     def warmup(self) -> dict[str, object]:
-        voice_name = str(self.runtime.list_builtin_voices()[0]["voice"])
+        voice_name = (
+            FIXED_BUILTIN_VOICE
+            if FIXED_BUILTIN_VOICE is not None
+            else str(self.runtime.list_builtin_voices()[0]["voice"])
+        )
         return self.synthesize(
             text="Warmup.",
             mode="voice_clone",
