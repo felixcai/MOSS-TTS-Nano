@@ -28,6 +28,10 @@ APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR
 from ort_cpu_runtime import _resolve_stream_decode_frame_budget
 
+# 固定使用的内置音色名称。设为 None 时保持原始行为（使用请求传入的 voice / prompt_audio_path 参数）；
+# 设为具体字符串（如 "zh_female_1"）时强制使用该内置音色，忽略请求中的 voice / prompt_audio_path 参数。
+FIXED_BUILTIN_VOICE: str | None = "Lingyu"
+
 _LEGACY_RENDER_INDEX_HTML = legacy_app._render_index_html
 
 
@@ -339,7 +343,11 @@ class OnnxNanoTTSServiceAdapter:
                 )
                 start_time = time.perf_counter()
                 # 步骤1：自定义音频走 codec_encode 编码，内置音色从 manifest 读取预编码 codes
-                prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
+                # 若 FIXED_BUILTIN_VOICE 已配置，则强制使用该内置音色，忽略请求传入的 voice / prompt_audio_path
+                if FIXED_BUILTIN_VOICE is not None:
+                    prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=FIXED_BUILTIN_VOICE, prompt_audio_path=None)
+                else:
+                    prompt_audio_codes = self.runtime.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
                 # 步骤2：三层策略将长文本切分为不超过 token 预算的 chunk 列表
                 text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
                 sample_rate = int(self.runtime.codec_meta["codec_config"]["sample_rate"])
