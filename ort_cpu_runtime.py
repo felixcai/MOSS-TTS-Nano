@@ -496,6 +496,7 @@ class OrtCpuRuntime:
     # [非调用链] 服务启动时的预热函数，用于提前触发 ONNX 图优化和算子初始化，降低首次推理延迟
     # 不在 stream generate 调用链中，运行于服务初始化阶段
     def warmup(self, *, voice_name: str | None = None) -> None:
+        _log_memory("warmup: OrtCpuRuntime.warmup start")
         voices = self.list_builtin_voices()
         if voice_name is not None:
             voice = next((v for v in voices if v["voice"] == voice_name), voices[0])
@@ -511,7 +512,9 @@ class OrtCpuRuntime:
         
         try:
             # 直接调用 generate_audio_frames，这会预热 prefill, local_decoder, 以及 decode
+            _log_memory("warmup: before generate_audio_frames (prefill/local_decoder/decode)")
             generated_frames = self.generate_audio_frames(request_rows)
+            _log_memory("warmup: after generate_audio_frames")
         finally:
             # 恢复原始配置
             self.manifest["generation_defaults"]["max_new_frames"] = original_max_new_frames
@@ -562,10 +565,12 @@ class OrtCpuRuntime:
         # --------------------------------------------------------------------------------
         # 预热流式解码器
         # --------------------------------------------------------------------------------
+        _log_memory("warmup: before codec_streaming_session.run_frames")
         self.codec_streaming_session.reset()
         # 传入刚才生成的真实帧（16帧）进行流式解码预热
         self.codec_streaming_session.run_frames(generated_frames)
         self.codec_streaming_session.reset()
+        _log_memory("warmup: after codec_streaming_session.run_frames")
 
     # [调用链内部] 被 build_voice_clone_request_rows 调用
     # 将文本 token id 列表编码为 (n_vq+1) 宽的行矩阵，音频列填充 audio_pad_token_id
