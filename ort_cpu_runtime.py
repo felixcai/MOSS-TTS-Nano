@@ -468,16 +468,16 @@ class OrtCpuRuntime:
         sessions: dict[str, ort.InferenceSession] = {
             "prefill": self._session(tts_dir / self.tts_meta["files"]["prefill"]),
             "decode": self._session(tts_dir / self.tts_meta["files"]["decode_step"]),
-            "local_decoder": self._session(tts_dir / self.tts_meta["files"]["local_decoder"]),
+            # "local_decoder": self._session(tts_dir / self.tts_meta["files"]["local_decoder"]),
         }
-        if self.tts_meta["files"].get("local_greedy_frame"):
-            sessions["local_greedy_frame"] = self._session(tts_dir / self.tts_meta["files"]["local_greedy_frame"])
+        # if self.tts_meta["files"].get("local_greedy_frame"):
+        #     sessions["local_greedy_frame"] = self._session(tts_dir / self.tts_meta["files"]["local_greedy_frame"])
         if self.tts_meta["files"].get("local_fixed_sampled_frame"):
             sessions["local_fixed_sampled_frame"] = self._session(
                 tts_dir / self.tts_meta["files"]["local_fixed_sampled_frame"]
             )
-        if self.tts_meta["files"].get("local_cached_step"):
-            sessions["local_cached_step"] = self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])
+        # if self.tts_meta["files"].get("local_cached_step"):
+        #     sessions["local_cached_step"] = self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])
         _log_memory("runtime_init: _create_sessions TTS part done (prefill/decode/local_*)")
         sessions["codec_encode"] = self._session(codec_dir / self.codec_meta["files"]["encode"])
         sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
