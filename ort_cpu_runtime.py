@@ -17,6 +17,7 @@ from __future__ import annotations
 # =============================================================================
 
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass
@@ -29,6 +30,22 @@ import onnxruntime as ort
 SAMPLE_MODE_GREEDY = "greedy"
 SAMPLE_MODE_FIXED = "fixed"
 SAMPLE_MODE_FULL = "full"
+
+
+def _log_memory(label: str) -> None:
+    try:
+        import psutil
+
+        proc_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        sys_used_mb = psutil.virtual_memory().used / (1024 * 1024)
+        logging.info(
+            "[MEM] %s | proc_rss=%.1f MB | sys_used=%.1f MB",
+            label,
+            proc_rss_mb,
+            sys_used_mb,
+        )
+    except Exception:
+        pass
 
 MANIFEST_CANDIDATE_RELATIVE_PATHS = (
     "browser_poc_manifest.json",
@@ -363,6 +380,7 @@ class OrtCpuRuntime:
     ) -> None:
         self.model_dir = Path(model_dir).expanduser().resolve()
         self.thread_count = max(1, int(thread_count))
+        _log_memory("runtime_init: OrtCpuRuntime __init__ entry (model_dir+thread_count)")
         self.manifest_path = self._resolve_manifest_path(self.model_dir)
         self.manifest_dir = self.manifest_path.parent
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
@@ -384,14 +402,18 @@ class OrtCpuRuntime:
         self.codec_meta_path = self.resolve_manifest_relative_path(manifest["model_files"]["codec_meta"])
         self.tts_meta = json.loads(self.tts_meta_path.read_text(encoding="utf-8"))
         self.codec_meta = json.loads(self.codec_meta_path.read_text(encoding="utf-8"))
+        _log_memory("runtime_init: OrtCpuRuntime manifest+tts_meta+codec_meta loaded")
         self.rng = np.random.default_rng(1234)
         # 一次性加载所有 ONNX 模型（prefill / decode / local_decoder / codec 等）
+        _log_memory("runtime_init: OrtCpuRuntime before _create_sessions")
         self.sessions = self._create_sessions()
+        _log_memory("runtime_init: OrtCpuRuntime after _create_sessions (all InferenceSession)")
         # 创建流式 codec 解码会话，绑定 codec_decode_step session
         self.codec_streaming_session = CodecStreamingDecodeSession(
             codec_meta=self.codec_meta,
             session=self.sessions["codec_decode_step"],
         )
+        _log_memory("runtime_init: OrtCpuRuntime CodecStreamingDecodeSession ready")
 
     # [调用链内部] 被 __init__ 调用，在模型目录下按优先级搜索 manifest 文件
     @staticmethod
@@ -443,29 +465,25 @@ class OrtCpuRuntime:
     def _create_sessions(self) -> dict[str, ort.InferenceSession]:
         tts_dir = self.tts_meta_path.parent
         codec_dir = self.codec_meta_path.parent
-        return {
+        sessions: dict[str, ort.InferenceSession] = {
             "prefill": self._session(tts_dir / self.tts_meta["files"]["prefill"]),
             "decode": self._session(tts_dir / self.tts_meta["files"]["decode_step"]),
             "local_decoder": self._session(tts_dir / self.tts_meta["files"]["local_decoder"]),
-            **(
-                {"local_greedy_frame": self._session(tts_dir / self.tts_meta["files"]["local_greedy_frame"])}
-                if self.tts_meta["files"].get("local_greedy_frame")
-                else {}
-            ),
-            **(
-                {"local_fixed_sampled_frame": self._session(tts_dir / self.tts_meta["files"]["local_fixed_sampled_frame"])}
-                if self.tts_meta["files"].get("local_fixed_sampled_frame")
-                else {}
-            ),
-            **(
-                {"local_cached_step": self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])}
-                if self.tts_meta["files"].get("local_cached_step")
-                else {}
-            ),
-            "codec_encode": self._session(codec_dir / self.codec_meta["files"]["encode"]),
-            "codec_decode": self._session(codec_dir / self.codec_meta["files"]["decode_full"]),
-            "codec_decode_step": self._session(codec_dir / self.codec_meta["files"]["decode_step"]),
         }
+        if self.tts_meta["files"].get("local_greedy_frame"):
+            sessions["local_greedy_frame"] = self._session(tts_dir / self.tts_meta["files"]["local_greedy_frame"])
+        if self.tts_meta["files"].get("local_fixed_sampled_frame"):
+            sessions["local_fixed_sampled_frame"] = self._session(
+                tts_dir / self.tts_meta["files"]["local_fixed_sampled_frame"]
+            )
+        if self.tts_meta["files"].get("local_cached_step"):
+            sessions["local_cached_step"] = self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])
+        _log_memory("runtime_init: _create_sessions TTS part done (prefill/decode/local_*)")
+        sessions["codec_encode"] = self._session(codec_dir / self.codec_meta["files"]["encode"])
+        sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
+        sessions["codec_decode_step"] = self._session(codec_dir / self.codec_meta["files"]["decode_step"])
+        _log_memory("runtime_init: _create_sessions codec part done (encode/decode_full/decode_step)")
+        return sessions
 
     # [非调用链] 返回 manifest 中内置语音列表，供上层接口展示可用音色
     def list_builtin_voices(self) -> list[dict[str, Any]]:

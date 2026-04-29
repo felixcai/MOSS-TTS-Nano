@@ -31,6 +31,21 @@ from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_req
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR
+
+
+def _log_memory(label: str) -> None:
+    try:
+        import psutil
+        proc_rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        sys_used_mb = psutil.virtual_memory().used / (1024 * 1024)
+        logging.info(
+            "[MEM] %s | proc_rss=%.1f MB | sys_used=%.1f MB",
+            label, proc_rss_mb, sys_used_mb,
+        )
+    except Exception:
+        pass
+
+
 from ort_cpu_runtime import (
     OrtCpuRuntime,
     _normalize_sample_mode,
@@ -52,7 +67,7 @@ DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 0.40
 DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 0.24
 SENTENCE_END_PUNCTUATION = set(".!?。！？；;")
 CLAUSE_SPLIT_PUNCTUATION = set(",，、；;：:")
-CLOSING_PUNCTUATION = set("\"'"')]}）】》」』")
+CLOSING_PUNCTUATION = set("\"'”’)]}）】》」』")
 
 
 MODEL_MANIFEST_CANDIDATE_RELATIVE_PATHS = (
@@ -362,7 +377,9 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         output_dir: str | Path = DEFAULT_OUTPUT_DIR,
     ) -> None:
         # 确认模型目录有效，必要时触发 HuggingFace 下载
+        _log_memory("OnnxTtsRuntime.__init__: before ensure_browser_onnx_model_dir")
         resolved_model_dir = ensure_browser_onnx_model_dir(model_dir)
+        _log_memory("OnnxTtsRuntime.__init__: after ensure_browser_onnx_model_dir, before OrtCpuRuntime")
         # 调用父类 OrtCpuRuntime 完成所有 ONNX InferenceSession 的创建
         super().__init__(
             model_dir=resolved_model_dir,
@@ -371,12 +388,14 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             do_sample=do_sample,
             sample_mode=sample_mode,
         )
+        _log_memory("OnnxTtsRuntime.__init__: after OrtCpuRuntime super().__init__")
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         # 从 manifest 解析 tokenizer 路径并加载 SentencePiece 模型
         tokenizer_relative_path = str(self.manifest["model_files"].get("tokenizer_model", "tokenizer.model"))
         tokenizer_path = self.resolve_manifest_relative_path(tokenizer_relative_path)
         self.sp_model = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
+        _log_memory("OnnxTtsRuntime.__init__: after SentencePiece tokenizer load")
         self._text_normalizer_manager: WeTextProcessingManager | None = None
 
     # [非调用链] 仅被 prepare_synthesis_text 调用，而 prepare_synthesis_text
@@ -663,7 +682,9 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         request_rows = self.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
         if not streaming:
             generated_frames = self.generate_audio_frames(request_rows)
+            _log_memory("synthesize_single_chunk: generate_audio_frames done (prefill + local_decode sessions)")
             waveform = self.decode_full_audio_safe(generated_frames)
+            _log_memory("synthesize_single_chunk: decode_full_audio_safe done (codec_decode session)")
             return {
                 "text": text,
                 "text_token_ids": text_token_ids,
@@ -811,6 +832,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         )
         prepared_text = str(prepared_texts["text"])
         prompt_audio_codes = self.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
+        _log_memory("synthesize: resolve_prompt_audio_codes done (codec_encode session if custom audio, else builtin voice lookup)")
         text_chunks = self.split_voice_clone_text(prepared_text, max_tokens=int(voice_clone_max_text_tokens))
         t_before_first_chunk = time.perf_counter()
         all_waveforms: list[np.ndarray] = []

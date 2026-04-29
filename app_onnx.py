@@ -74,8 +74,10 @@ class OnnxNanoTTSServiceAdapter:
         max_new_frames: int = 375,
         text_normalizer_manager: WeTextProcessingManager | None = None,
     ) -> None:
+        _log_memory("runtime_init: OnnxNanoTTSServiceAdapter __init__ entry")
         self.output_dir = Path(output_dir or (APP_DIR / "generated_audio")).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        _log_memory("runtime_init: OnnxNanoTTSServiceAdapter output_dir ready, before OnnxTtsRuntime")
         # 创建 OnnxTtsRuntime（内部创建全部 ONNX InferenceSession 和 CodecStreamingDecodeSession）
         self.runtime = OnnxTtsRuntime(
             model_dir=model_dir,
@@ -83,6 +85,7 @@ class OnnxNanoTTSServiceAdapter:
             max_new_frames=int(max_new_frames),
             output_dir=self.output_dir,
         )
+        _log_memory("runtime_init: OnnxNanoTTSServiceAdapter after OnnxTtsRuntime, wiring paths")
         self.model_dir = self.runtime.model_dir
         self.runtime._text_normalizer_manager = text_normalizer_manager
         self.device = _CpuDeviceInfo()
@@ -95,6 +98,7 @@ class OnnxNanoTTSServiceAdapter:
         self.checkpoint_path = self.runtime.tts_meta_path.parent.resolve()
         self.audio_tokenizer_path = self.runtime.codec_meta_path.parent.resolve()
         self.thread_count = max(1, int(cpu_threads))
+        _log_memory("runtime_init: OnnxNanoTTSServiceAdapter __init__ complete")
 
     # [非调用链] 兼容接口：app.py 在某些路径下访问 runtime.get_model()，
     # stream generate / 非流式推理 均不经过此方法
@@ -107,6 +111,7 @@ class OnnxNanoTTSServiceAdapter:
     # codec_decode_step（stream generate 流式解码专用）在 synthesize() 路径中不被触发，
     # 因此在 synthesize() 完成后额外预热一次 codec_streaming_session。
     def warmup(self) -> dict[str, object]:
+        _log_memory("warmup: start")
         voice_name = (
             FIXED_BUILTIN_VOICE
             if FIXED_BUILTIN_VOICE is not None
@@ -129,6 +134,7 @@ class OnnxNanoTTSServiceAdapter:
             audio_repetition_penalty=1.2,
             seed=1234,
         )
+        _log_memory("warmup: synthesize done (prefill/local_decode/codec_decode sessions)")
         # 补充预热 codec_decode_step（stream generate 流式解码 Session）：
         # synthesize() 走全量 codec_decode 路径，不触发 codec_decode_step，
         # 若不预热则首次 synthesize_stream 请求会产生额外的首帧延迟
@@ -137,6 +143,7 @@ class OnnxNanoTTSServiceAdapter:
         self.runtime.codec_streaming_session.reset()
         self.runtime.codec_streaming_session.run_frames(empty_frames)
         self.runtime.codec_streaming_session.reset()
+        _log_memory("warmup: complete (codec_decode_step session done)")
         return result
 
     # [非调用链] 对 runtime.split_voice_clone_text 的公开包装方法，供 app.py 直接调用；
@@ -776,10 +783,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=logging.INFO,
     )
+    _log_memory("main: startup baseline")
 
     text_normalizer_manager = WeTextProcessingManager()
     text_normalizer_manager.start()
     output_dir = Path(args.output_dir).expanduser().resolve()
+    _log_memory("main: before runtime init")
     runtime = OnnxNanoTTSServiceAdapter(
         model_dir=args.model_dir,
         output_dir=output_dir,
