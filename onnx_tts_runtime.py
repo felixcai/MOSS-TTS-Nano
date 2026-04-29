@@ -682,9 +682,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         request_rows = self.build_voice_clone_request_rows(prompt_audio_codes, text_token_ids)
         if not streaming:
             generated_frames = self.generate_audio_frames(request_rows)
-            _log_memory("synthesize_single_chunk: generate_audio_frames done (prefill + local_decode sessions)")
             waveform = self.decode_full_audio_safe(generated_frames)
-            _log_memory("synthesize_single_chunk: decode_full_audio_safe done (codec_decode session)")
             return {
                 "text": text,
                 "text_token_ids": text_token_ids,
@@ -832,7 +830,6 @@ class OnnxTtsRuntime(OrtCpuRuntime):
         )
         prepared_text = str(prepared_texts["text"])
         prompt_audio_codes = self.resolve_prompt_audio_codes(voice=voice, prompt_audio_path=prompt_audio_path)
-        _log_memory("synthesize: resolve_prompt_audio_codes done (codec_encode session if custom audio, else builtin voice lookup)")
         text_chunks = self.split_voice_clone_text(prepared_text, max_tokens=int(voice_clone_max_text_tokens))
         t_before_first_chunk = time.perf_counter()
         all_waveforms: list[np.ndarray] = []
