@@ -102,14 +102,17 @@ class OnnxNanoTTSServiceAdapter:
         return self
 
     # [非调用链-初始化] 服务启动后由 WarmupManager 触发一次完整的非流式推理，
-    # 目的是让 ONNX Session 完成首次 JIT 编译 / Arena 预分配，降低首请求冷启动延迟
+    # 目的是让 ONNX Session 完成首次 JIT 编译 / Arena 预分配，降低首请求冷启动延迟。
+    # self.synthesize() 覆盖 prefill / local_cached_step / local_decoder / codec_encode（自定义音频路径）
+    # codec_decode_step（stream generate 流式解码专用）在 synthesize() 路径中不被触发，
+    # 因此在 synthesize() 完成后额外预热一次 codec_streaming_session。
     def warmup(self) -> dict[str, object]:
         voice_name = (
             FIXED_BUILTIN_VOICE
             if FIXED_BUILTIN_VOICE is not None
             else str(self.runtime.list_builtin_voices()[0]["voice"])
         )
-        return self.synthesize(
+        result = self.synthesize(
             text="Warmup.",
             mode="voice_clone",
             voice=voice_name,
@@ -126,6 +129,15 @@ class OnnxNanoTTSServiceAdapter:
             audio_repetition_penalty=1.2,
             seed=1234,
         )
+        # 补充预热 codec_decode_step（stream generate 流式解码 Session）：
+        # synthesize() 走全量 codec_decode 路径，不触发 codec_decode_step，
+        # 若不预热则首次 synthesize_stream 请求会产生额外的首帧延迟
+        n_vq = int(self.runtime.manifest["tts_config"]["n_vq"])
+        empty_frames = [([0] * n_vq)]
+        self.runtime.codec_streaming_session.reset()
+        self.runtime.codec_streaming_session.run_frames(empty_frames)
+        self.runtime.codec_streaming_session.reset()
+        return result
 
     # [非调用链] 对 runtime.split_voice_clone_text 的公开包装方法，供 app.py 直接调用；
     # stream generate 路径中 _worker 直接调用 self.runtime.split_voice_clone_text，不经过此方法
