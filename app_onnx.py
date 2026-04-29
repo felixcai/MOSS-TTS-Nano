@@ -781,7 +781,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=18083)
-    parser.add_argument("--cpu-threads", type=int, default=max(1, int(os.cpu_count() or 1)))
+    parser.add_argument("--cpu-threads", type=int, default=1)
     parser.add_argument("--max-new-frames", type=int, default=375)
     parser.add_argument("--share", action="store_true")
     return parser.parse_args(argv)
