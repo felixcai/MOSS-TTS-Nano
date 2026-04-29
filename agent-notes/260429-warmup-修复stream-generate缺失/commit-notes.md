@@ -1,3 +1,83 @@
+# commit 6e689f6 — 把方案B的预热逻辑，改成和方案A同样 （但仍然去掉了全量解码）
+
+## 改动文件
+
+- `ort_cpu_runtime.py`
+
+## 问题背景
+
+在采用方案 B（直接调用底层 `runtime.warmup()`）后，虽然省去了多余的 `codec_decode`（全量解码）预热，但发现底层的原生预热逻辑过于简陋：它只执行了 `prefill` 和 1 次局部解码器，**完全没有预热 `decode` Session**（自回归核心模型）。这会导致第一次真实请求时，自回归循环的第一步产生冷启动延迟。
+
+为了达到和原方案 A（模拟真实请求生成 16 帧）一样的预热深度，我们需要修改底层的预热逻辑。
+
+## 修复内容
+
+### `ort_cpu_runtime.py`：`OrtCpuRuntime.warmup`
+
+**修改前**
+
+```python
+def warmup(self, *, voice_name: str | None = None) -> None:
+    ...
+    # 冗长的手动 prefill 和 1 次 local_decoder 调用
+    outputs = self.sessions["prefill"].run(...)
+    ...
+    if "local_cached_step" in self.sessions:
+        self.run_local_cached_step(...)
+    ...
+
+    empty_frames = [([0] * int(self.manifest["tts_config"]["n_vq"]))]
+    # self.decode_full_audio(empty_frames)
+    self.codec_streaming_session.reset()
+    self.codec_streaming_session.run_frames(empty_frames)
+    self.codec_streaming_session.reset()
+```
+
+**修改后**
+
+```python
+def warmup(self, *, voice_name: str | None = None) -> None:
+    ...
+    # 强制设置 max_new_frames 为 16 (与方案 A 保持一致)，以触发完整的 generate_audio_frames 循环（包含 decode Session）
+    original_max_new_frames = self.manifest["generation_defaults"]["max_new_frames"]
+    self.manifest["generation_defaults"]["max_new_frames"] = 16
+
+    try:
+        # 直接调用 generate_audio_frames，这会预热 prefill, local_decoder, 以及 decode
+        generated_frames = self.generate_audio_frames(request_rows)
+    finally:
+        # 恢复原始配置
+        self.manifest["generation_defaults"]["max_new_frames"] = original_max_new_frames
+
+    # ... 原有的冗长预热逻辑被注释保留 ...
+
+    # 预热流式解码器
+    self.codec_streaming_session.reset()
+    # 传入刚才生成的真实帧（16帧）进行流式解码预热
+    self.codec_streaming_session.run_frames(generated_frames)
+    self.codec_streaming_session.reset()
+```
+
+**改动要点**
+
+1. 废弃了手动拼接 `prefill` 和 `local_decoder` 的冗长代码（改为注释保留）。
+2. 临时将 `max_new_frames` 覆盖为 `16`，然后直接调用核心的 `generate_audio_frames` 函数。这强制模型走完 16 次自回归循环，完美预热了 `prefill`、局部解码器以及 **`decode` Session**。
+3. 预热流式解码器（`codec_decode_step`）时，不再使用全 0 的 `empty_frames`，而是传入刚才生成的 16 帧真实数据 `generated_frames`，更贴近真实场景。
+4. 依然保持 `decode_full_audio` 被注释，确保全量解码不被加载。
+
+## 预热覆盖情况（最终版）
+
+| ONNX Session                            | stream generate 需要 | 最终覆盖情况                        |
+| --------------------------------------- | ------------------ | ----------------------------- |
+| `prefill`                               | ✅                  | ✅（`generate_audio_frames` 路径） |
+| `local_cached_step` / `local_decoder` 等 | ✅                  | ✅（`generate_audio_frames` 路径） |
+| **`decode`**                            | ✅                  | ✅ **（本次修复新增，自回归核心）**          |
+| `codec_decode`（全量解码）                    | ❌ 非流式专用            | ❌ **已移除预热，可安全不加载**            |
+| `codec_decode_step`（逐帧流式解码）             | ✅                  | ✅（传入真实 16 帧预热）                |
+| `codec_encode`                          | 仅自定义音频路径           | ❌ 仍未覆盖（内置音色跳过，暂不处理）           |
+
+---
+
 # commit e1187b5 — 采用方案 B 整体替换 warmup 逻辑，并省去 codec_decode 预热
 
 ## 改动文件
