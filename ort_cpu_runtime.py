@@ -504,46 +504,67 @@ class OrtCpuRuntime:
         # voice = self.list_builtin_voices()[0]
         text_sample = self.list_text_samples()[0]
         request_rows = self.build_voice_clone_request_rows(voice["prompt_audio_codes"], text_sample["text_token_ids"])
-        prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
-        prefill_mask, prefill_mask_dims = _flatten2d_int32(request_rows["attentionMask"])
-        outputs = self.sessions["prefill"].run(
-            None,
-            {
-                "input_ids": prefill_ids.reshape(prefill_dims),
-                "attention_mask": prefill_mask.reshape(prefill_mask_dims),
-            },
-        )
-        output_names = [output.name for output in self.sessions["prefill"].get_outputs()]
-        named_outputs = dict(zip(output_names, outputs, strict=True))
-        global_hidden = _extract_last_hidden(named_outputs["global_hidden"])
-        if "local_cached_step" in self.sessions:
-            local_past_by_name = self.create_empty_local_cached_past()
-            _text_logits, _audio_logits, _next_local_past = self.run_local_cached_step(
-                global_hidden,
-                text_token_id=0,
-                audio_token_id=0,
-                channel_index=0,
-                step_type=0,
-                past_valid_lengths=0,
-                local_past_by_name=local_past_by_name,
-            )
-        if "local_fixed_sampled_frame" in self.sessions and self.manifest["generation_defaults"]["sample_mode"] == SAMPLE_MODE_FIXED:
-            self.run_local_fixed_sampled_frame(
-                global_hidden,
-                previous_token_sets_by_channel=[set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))],
-            )
-        elif "local_greedy_frame" in self.sessions and not bool(self.manifest["generation_defaults"]["do_sample"]):
-            self.run_local_greedy_frame(
-                global_hidden,
-                previous_token_sets_by_channel=[set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))],
-                repetition_penalty=float(self.manifest["generation_defaults"]["audio_repetition_penalty"]),
-            )
-        else:
-            self.run_local_decoder(global_hidden, self.manifest["tts_config"]["audio_assistant_slot_token_id"], [])
-        empty_frames = [([0] * int(self.manifest["tts_config"]["n_vq"]))]
+        
+        # 强制设置 max_new_frames 为 16 (与方案 A 保持一致)，以触发完整的 generate_audio_frames 循环（包含 decode Session）
+        original_max_new_frames = self.manifest["generation_defaults"]["max_new_frames"]
+        self.manifest["generation_defaults"]["max_new_frames"] = 16
+        
+        try:
+            # 直接调用 generate_audio_frames，这会预热 prefill, local_decoder, 以及 decode
+            generated_frames = self.generate_audio_frames(request_rows)
+        finally:
+            # 恢复原始配置
+            self.manifest["generation_defaults"]["max_new_frames"] = original_max_new_frames
+
+        # --------------------------------------------------------------------------------
+        # 原有的冗长预热逻辑（已注释，保留作为参考）
+        # --------------------------------------------------------------------------------
+        # prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
+        # prefill_mask, prefill_mask_dims = _flatten2d_int32(request_rows["attentionMask"])
+        # outputs = self.sessions["prefill"].run(
+        #     None,
+        #     {
+        #         "input_ids": prefill_ids.reshape(prefill_dims),
+        #         "attention_mask": prefill_mask.reshape(prefill_mask_dims),
+        #     },
+        # )
+        # output_names = [output.name for output in self.sessions["prefill"].get_outputs()]
+        # named_outputs = dict(zip(output_names, outputs, strict=True))
+        # global_hidden = _extract_last_hidden(named_outputs["global_hidden"])
+        # if "local_cached_step" in self.sessions:
+        #     local_past_by_name = self.create_empty_local_cached_past()
+        #     _text_logits, _audio_logits, _next_local_past = self.run_local_cached_step(
+        #         global_hidden,
+        #         text_token_id=0,
+        #         audio_token_id=0,
+        #         channel_index=0,
+        #         step_type=0,
+        #         past_valid_lengths=0,
+        #         local_past_by_name=local_past_by_name,
+        #     )
+        # if "local_fixed_sampled_frame" in self.sessions and self.manifest["generation_defaults"]["sample_mode"] == SAMPLE_MODE_FIXED:
+        #     self.run_local_fixed_sampled_frame(
+        #         global_hidden,
+        #         previous_token_sets_by_channel=[set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))],
+        #     )
+        # elif "local_greedy_frame" in self.sessions and not bool(self.manifest["generation_defaults"]["do_sample"]):
+        #     self.run_local_greedy_frame(
+        #         global_hidden,
+        #         previous_token_sets_by_channel=[set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))],
+        #         repetition_penalty=float(self.manifest["generation_defaults"]["audio_repetition_penalty"]),
+        #     )
+        # else:
+        #     self.run_local_decoder(global_hidden, self.manifest["tts_config"]["audio_assistant_slot_token_id"], [])
+        
+        # empty_frames = [([0] * int(self.manifest["tts_config"]["n_vq"]))]
         # self.decode_full_audio(empty_frames)
+        
+        # --------------------------------------------------------------------------------
+        # 预热流式解码器
+        # --------------------------------------------------------------------------------
         self.codec_streaming_session.reset()
-        self.codec_streaming_session.run_frames(empty_frames)
+        # 传入刚才生成的真实帧（16帧）进行流式解码预热
+        self.codec_streaming_session.run_frames(generated_frames)
         self.codec_streaming_session.reset()
 
     # [调用链内部] 被 build_voice_clone_request_rows 调用
