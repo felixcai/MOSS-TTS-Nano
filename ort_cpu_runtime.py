@@ -513,7 +513,10 @@ class OrtCpuRuntime:
         try:
             # 直接调用 generate_audio_frames，这会预热 prefill, local_decoder, 以及 decode
             _log_memory("warmup: before generate_audio_frames (prefill/local_decoder/decode)")
-            generated_frames = self.generate_audio_frames(request_rows)
+            generated_frames = self.generate_audio_frames(
+                request_rows,
+                mem_trace_label="warmup: generate_audio_frames",
+            )
             _log_memory("warmup: after generate_audio_frames")
         finally:
             # 恢复原始配置
@@ -802,13 +805,21 @@ class OrtCpuRuntime:
         self,
         request_rows: dict[str, list[list[int]]],
         on_frame: Callable[[list[list[int]], int, list[int]], None] | None = None,
+        mem_trace_label: str | None = None,
     ) -> list[list[int]]:
+        def _trace_memory(step: str) -> None:
+            if mem_trace_label:
+                _log_memory(f"{mem_trace_label}: {step}")
+
+        _trace_memory("entry")
         generation_defaults = self.manifest["generation_defaults"]
         row_width = int(self.manifest["tts_config"]["n_vq"]) + 1
 
         # ── 阶段 1：Prefill ──────────────────────────────────────────────────
         prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
         prefill_mask, prefill_mask_dims = _flatten2d_int32(request_rows["attentionMask"])
+        _trace_memory("after build prefill inputs")
+        _trace_memory("before prefill.run")
         outputs = self.sessions["prefill"].run(
             None,
             {
@@ -816,6 +827,7 @@ class OrtCpuRuntime:
                 "attention_mask": prefill_mask.reshape(prefill_mask_dims),
             },
         )
+        _trace_memory("after prefill.run")
         output_names = [output.name for output in self.sessions["prefill"].get_outputs()]
         named_outputs = dict(zip(output_names, outputs, strict=True))
         # 取序列最后一步的隐状态作为第一帧生成的条件向量
@@ -826,6 +838,7 @@ class OrtCpuRuntime:
             output_name.replace("present_", "past_"): named_outputs[output_name]
             for output_name in self.tts_meta["onnx"]["prefill_output_names"][1:]
         }
+        _trace_memory("after build prefill outputs and past cache")
 
         # ── 阶段 2：自回归 Decode 循环 ────────────────────────────────────────
         generated_frames: list[list[int]] = []
@@ -837,14 +850,20 @@ class OrtCpuRuntime:
 
         for step_index in range(int(generation_defaults["max_new_frames"])):
             frame: list[int] = []
+            if step_index == 0:
+                _trace_memory("decode loop first frame start")
 
             # 路径 A：local_greedy_frame（整帧一次推理，greedy 模式）
             if "local_greedy_frame" in self.sessions and not bool(generation_defaults["do_sample"]):
+                if step_index == 0:
+                    _trace_memory("before first local_greedy_frame.run")
                 should_continue, frame = self.run_local_greedy_frame(
                     global_hidden,
                     previous_token_sets_by_channel=previous_token_sets_by_channel,
                     repetition_penalty=float(generation_defaults["audio_repetition_penalty"]),
                 )
+                if step_index == 0:
+                    _trace_memory("after first local_greedy_frame.run")
                 if not should_continue:
                     break
                 for channel_index, sampled_token in enumerate(frame):
@@ -853,10 +872,14 @@ class OrtCpuRuntime:
 
             # 路径 B：local_fixed_sampled_frame（整帧一次推理，fixed 采样模式）
             elif "local_fixed_sampled_frame" in self.sessions and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED:
+                if step_index == 0:
+                    _trace_memory("before first local_fixed_sampled_frame.run")
                 should_continue, frame = self.run_local_fixed_sampled_frame(
                     global_hidden,
                     previous_token_sets_by_channel=previous_token_sets_by_channel,
                 )
+                if step_index == 0:
+                    _trace_memory("after first local_fixed_sampled_frame.run")
                 if not should_continue:
                     break
                 for channel_index, sampled_token in enumerate(frame):
@@ -867,8 +890,12 @@ class OrtCpuRuntime:
             elif "local_cached_step" in self.sessions:
                 local_past_by_name = self.create_empty_local_cached_past()
                 local_past_valid_length = 0
+                if step_index == 0:
+                    _trace_memory("after first local_cached_step empty past")
 
                 # step_type=0：text 预测步，判断是继续生成音频还是结束
+                if step_index == 0:
+                    _trace_memory("before first local_cached_step text.run")
                 local_text_logits, _ignored_audio_logits, local_past_by_name = self.run_local_cached_step(
                     global_hidden,
                     text_token_id=0,
@@ -878,6 +905,8 @@ class OrtCpuRuntime:
                     past_valid_lengths=local_past_valid_length,
                     local_past_by_name=local_past_by_name,
                 )
+                if step_index == 0:
+                    _trace_memory("after first local_cached_step text.run")
                 local_past_valid_length += 1
                 next_text_token = _sample_assistant_text_token(
                     local_text_logits,
@@ -890,6 +919,8 @@ class OrtCpuRuntime:
                     break
 
                 # step_type=1：第 0 声道采样步
+                if step_index == 0:
+                    _trace_memory("before first local_cached_step channel0.run")
                 _unused_text_logits, audio_logits, local_past_by_name = self.run_local_cached_step(
                     global_hidden,
                     text_token_id=next_text_token,
@@ -899,6 +930,8 @@ class OrtCpuRuntime:
                     past_valid_lengths=local_past_valid_length,
                     local_past_by_name=local_past_by_name,
                 )
+                if step_index == 0:
+                    _trace_memory("after first local_cached_step channel0.run")
                 local_past_valid_length += 1
                 first_channel_logits = self.slice_audio_channel_logits(audio_logits, 0).astype(np.float32, copy=False)
                 sampled_token = _sample_audio_token(
@@ -916,6 +949,8 @@ class OrtCpuRuntime:
                 previous_token = sampled_token
                 host_sampled_channel_limit = int(self.manifest["tts_config"]["n_vq"])
                 for channel_index in range(1, host_sampled_channel_limit):
+                    if step_index == 0 and channel_index == 1:
+                        _trace_memory("before first local_cached_step remaining channels")
                     _unused_text_logits, audio_logits, local_past_by_name = self.run_local_cached_step(
                         global_hidden,
                         text_token_id=0,
@@ -938,10 +973,16 @@ class OrtCpuRuntime:
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
                     previous_token = sampled_token
+                if step_index == 0:
+                    _trace_memory("after first local_cached_step remaining channels")
 
             # 路径 D：local_decoder（无帧内 KV Cache 的 fallback，最慢）
             else:
+                if step_index == 0:
+                    _trace_memory("before first local_decoder text.run")
                 local_text_logits, _ = self.run_local_decoder(global_hidden, 0, [])
+                if step_index == 0:
+                    _trace_memory("after first local_decoder text.run")
                 next_text_token = _sample_assistant_text_token(
                     local_text_logits,
                     self.manifest,
@@ -951,6 +992,8 @@ class OrtCpuRuntime:
                 if next_text_token != int(self.manifest["tts_config"]["audio_assistant_slot_token_id"]):
                     break
                 for channel_index in range(int(self.manifest["tts_config"]["n_vq"])):
+                    if step_index == 0 and channel_index == 0:
+                        _trace_memory("before first local_decoder audio channels")
                     _, audio_logits = self.run_local_decoder(global_hidden, next_text_token, frame)
                     channel_logits = self.slice_audio_channel_logits(audio_logits, channel_index).astype(np.float32, copy=False)
                     sampled_token = _sample_audio_token(
@@ -963,6 +1006,8 @@ class OrtCpuRuntime:
                     frame.append(sampled_token)
                     previous_tokens_by_channel[channel_index].append(sampled_token)
                     previous_token_sets_by_channel[channel_index].add(sampled_token)
+                if step_index == 0:
+                    _trace_memory("after first local_decoder audio channels")
 
             generated_frames.append(frame)
 
@@ -979,7 +1024,11 @@ class OrtCpuRuntime:
             for input_name in self.tts_meta["onnx"]["decode_input_names"][2:]:
                 decode_feeds[input_name] = past_by_name[input_name]
             _last_decode_feeds = decode_feeds
+            if step_index == 0:
+                _trace_memory("before first decode.run")
             decode_outputs = self.sessions["decode"].run(None, decode_feeds)
+            if step_index == 0:
+                _trace_memory("after first decode.run")
             decode_output_names = [output.name for output in self.sessions["decode"].get_outputs()]
             named_decode_outputs = dict(zip(decode_output_names, decode_outputs, strict=True))
             global_hidden = _extract_last_hidden(named_decode_outputs["global_hidden"])
@@ -998,11 +1047,15 @@ class OrtCpuRuntime:
         # Decode 循环产生了大量大小不断变化的 KV Cache 张量，导致 GPU Arena 碎片化。
         # 在整个 chunk 结束后统一执行一次 Shrinkage，让 Arena 归还末尾的空闲块给系统，
         # 而不是在每帧后都触发（会严重拖慢推理速度）。
+        _trace_memory(f"decode loop done, generated_frames={len(generated_frames)}")
         if _last_decode_feeds is not None:
             _shrink_run_options = ort.RunOptions()
             _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+            _trace_memory("before decode arena shrinkage run")
             self.sessions["decode"].run(None, _last_decode_feeds, run_options=_shrink_run_options)
+            _trace_memory("after decode arena shrinkage run")
 
+        _trace_memory("return")
         return generated_frames
 
 __all__ = [
