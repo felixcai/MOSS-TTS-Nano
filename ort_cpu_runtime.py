@@ -480,7 +480,7 @@ class OrtCpuRuntime:
         #     sessions["local_cached_step"] = self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])
         _log_memory("runtime_init: _create_sessions TTS part done (prefill/decode/local_*)")
         sessions["codec_encode"] = self._session(codec_dir / self.codec_meta["files"]["encode"])
-        sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
+        # sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
         sessions["codec_decode_step"] = self._session(codec_dir / self.codec_meta["files"]["decode_step"])
         _log_memory("runtime_init: _create_sessions codec part done (encode/decode_full/decode_step)")
         return sessions
