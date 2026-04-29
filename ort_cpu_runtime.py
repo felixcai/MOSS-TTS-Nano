@@ -495,8 +495,13 @@ class OrtCpuRuntime:
 
     # [非调用链] 服务启动时的预热函数，用于提前触发 ONNX 图优化和算子初始化，降低首次推理延迟
     # 不在 stream generate 调用链中，运行于服务初始化阶段
-    def warmup(self) -> None:
-        voice = self.list_builtin_voices()[0]
+    def warmup(self, *, voice_name: str | None = None) -> None:
+        voices = self.list_builtin_voices()
+        if voice_name is not None:
+            voice = next((v for v in voices if v["voice"] == voice_name), voices[0])
+        else:
+            voice = voices[0]
+        # voice = self.list_builtin_voices()[0]
         text_sample = self.list_text_samples()[0]
         request_rows = self.build_voice_clone_request_rows(voice["prompt_audio_codes"], text_sample["text_token_ids"])
         prefill_ids, prefill_dims = _flatten3d_int32([request_rows["inputIds"]])
@@ -536,7 +541,7 @@ class OrtCpuRuntime:
         else:
             self.run_local_decoder(global_hidden, self.manifest["tts_config"]["audio_assistant_slot_token_id"], [])
         empty_frames = [([0] * int(self.manifest["tts_config"]["n_vq"]))]
-        self.decode_full_audio(empty_frames)
+        # self.decode_full_audio(empty_frames)
         self.codec_streaming_session.reset()
         self.codec_streaming_session.run_frames(empty_frames)
         self.codec_streaming_session.reset()

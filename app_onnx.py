@@ -117,34 +117,46 @@ class OnnxNanoTTSServiceAdapter:
             if FIXED_BUILTIN_VOICE is not None
             else str(self.runtime.list_builtin_voices()[0]["voice"])
         )
-        result = self.synthesize(
-            text="Warmup.",
-            mode="voice_clone",
-            voice=voice_name,
-            prompt_audio_path=None,
-            max_new_frames=min(16, int(self.runtime.manifest["generation_defaults"]["max_new_frames"])),
-            voice_clone_max_text_tokens=75,
-            do_sample=True,
-            text_temperature=1.0,
-            text_top_p=1.0,
-            text_top_k=50,
-            audio_temperature=0.8,
-            audio_top_p=0.95,
-            audio_top_k=25,
-            audio_repetition_penalty=1.2,
-            seed=1234,
-        )
-        _log_memory("warmup: synthesize done (prefill/local_decode/codec_decode sessions)")
-        # 补充预热 codec_decode_step（stream generate 流式解码 Session）：
-        # synthesize() 走全量 codec_decode 路径，不触发 codec_decode_step，
-        # 若不预热则首次 synthesize_stream 请求会产生额外的首帧延迟
-        n_vq = int(self.runtime.manifest["tts_config"]["n_vq"])
-        empty_frames = [([0] * n_vq)]
-        self.runtime.codec_streaming_session.reset()
-        self.runtime.codec_streaming_session.run_frames(empty_frames)
-        self.runtime.codec_streaming_session.reset()
+        
+        t0 = time.perf_counter()
+        self.runtime.warmup(voice_name=voice_name)
+        t1 = time.perf_counter()
+        
         _log_memory("warmup: complete (codec_decode_step session done)")
-        return result
+        
+        return {
+            "elapsed_seconds": t1 - t0,
+            "audio_path": None,
+        }
+        
+        # result = self.synthesize(
+        #     text="Warmup.",
+        #     mode="voice_clone",
+        #     voice=voice_name,
+        #     prompt_audio_path=None,
+        #     max_new_frames=min(16, int(self.runtime.manifest["generation_defaults"]["max_new_frames"])),
+        #     voice_clone_max_text_tokens=75,
+        #     do_sample=True,
+        #     text_temperature=1.0,
+        #     text_top_p=1.0,
+        #     text_top_k=50,
+        #     audio_temperature=0.8,
+        #     audio_top_p=0.95,
+        #     audio_top_k=25,
+        #     audio_repetition_penalty=1.2,
+        #     seed=1234,
+        # )
+        # _log_memory("warmup: synthesize done (prefill/local_decode/codec_decode sessions)")
+        # # 补充预热 codec_decode_step（stream generate 流式解码 Session）：
+        # # synthesize() 走全量 codec_decode 路径，不触发 codec_decode_step，
+        # # 若不预热则首次 synthesize_stream 请求会产生额外的首帧延迟
+        # n_vq = int(self.runtime.manifest["tts_config"]["n_vq"])
+        # empty_frames = [([0] * n_vq)]
+        # self.runtime.codec_streaming_session.reset()
+        # self.runtime.codec_streaming_session.run_frames(empty_frames)
+        # self.runtime.codec_streaming_session.reset()
+        # _log_memory("warmup: complete (codec_decode_step session done)")
+        # return result
 
     # [非调用链] 对 runtime.split_voice_clone_text 的公开包装方法，供 app.py 直接调用；
     # stream generate 路径中 _worker 直接调用 self.runtime.split_voice_clone_text，不经过此方法
