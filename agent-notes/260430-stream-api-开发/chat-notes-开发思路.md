@@ -190,6 +190,73 @@ stream_generate 进入时加锁
 
 后续如果要支持并发，应该做 runtime 池，每个并发槽位持有独立 runtime 或至少独立 codec streaming session 和 generation config。
 
+## 8.1 共享状态、独占粒度与锁所在层
+
+“共享状态”指的是：同一个 runtime 实例里，有一些会在生成过程中被读取和修改的对象；如果两个请求同时使用这个 runtime，它们会读写同一份对象，彼此影响。
+
+当前服务不是每个请求都新建一个 `OnnxTtsRuntime` / `OrtCpuRuntime`，而是服务启动时创建一个 runtime，然后所有请求复用它：
+
+```text
+request A ┐
+          ├─ 使用同一个 runtime 实例
+request B ┘
+```
+
+这些共享状态包括：
+
+- `codec_streaming_session`：维护流式 codec 解码的 KV cache。A 请求解码第 1、2、3 帧时，session 中保存的是 A 的历史状态；如果 B 请求同时调用 `reset()` 或 `run_frames()`，就可能覆盖 A 的状态，导致音频上下文串扰。
+- `manifest["generation_defaults"]`：当前 `app_onnx.py` 会在每次请求开始时把采样参数写入 runtime 的 manifest，例如 `sample_mode`、temperature、top_p、top_k、repetition penalty、seed 等。如果 A 和 B 同时运行，A 后续生成时可能读到 B 写入的参数。
+- `rng`：随机数生成器有内部状态。采样每抽一次 token，rng 状态都会前进；如果 A 和 B 同时使用同一个 rng，随机序列会交错。如果 B 重新设置 seed，也会影响 A 的采样结果。
+
+因此当前代码用 `_execution_lock` 保证同一时刻只有一个请求进入生成流程：
+
+```text
+A 请求生成中：独占 runtime
+B 请求等待：不能同时改 runtime 状态
+```
+
+这个独占粒度是“一次完整 stream generate 请求”，不是“一个 text chunk”。
+
+也就是说：
+
+```text
+A 请求拿到 _execution_lock
+  -> 处理 A 的所有 text chunks
+  -> 每个 text chunk 都生成完音频
+  -> chunk 间 pause 也发完
+  -> 最终 result event 产生
+  -> synthesize_stream 迭代结束
+A 释放 _execution_lock
+
+B 才能开始真正推理
+```
+
+原因是当前 `OnnxRequestRuntimeManager.iter_with_runtime()` 的结构是：
+
+```python
+with self._locked_runtime(...) as (...):
+    for item in factory(runtime):
+        yield item, execution_device, resolved_cpu_threads
+```
+
+`_locked_runtime()` 里的 `_execution_lock` 包住了整个 `for item in factory(runtime)`。而 `factory(runtime)` 对应一次完整的 `synthesize_stream(...)` 生成器；这个生成器内部会循环处理所有 `text_chunks`，不是一个 chunk 结束后就释放锁。
+
+锁的位置也需要注意：不是 `app.py` 直接上锁，而是 `app.py` 调用 `runtime_manager.iter_with_runtime()`，锁在 `app_onnx.py` 里的 `OnnxRequestRuntimeManager._locked_runtime()` 中加上。
+
+当前链路：
+
+```text
+app.py _run_streaming_job
+  -> runtime_manager.iter_with_runtime(...)
+     -> OnnxRequestRuntimeManager.iter_with_runtime(...)
+        -> with self._locked_runtime(...)
+           -> with self._execution_lock
+              -> for item in factory(runtime):
+                     yield item
+```
+
+拆到 `simple_moss` 后，这把锁更适合放在 `api_facade.py` 或 facade 内部的 runtime manager 中，而不是放在未来的 HTTP 路由层。这样无论是本地 test 调用还是 FastAPI 调用，都会遵守同一套单实例串行规则。
+
 ## 9. 推荐实施顺序
 
 ### 第一步：剥离 `simple_ort_cpu_runtime.py`

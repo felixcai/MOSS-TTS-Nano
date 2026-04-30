@@ -36,7 +36,7 @@ Use this skill when the user asks to:
 
 4. Organize chapters using the required rules:
    - If a topic or question is relatively independent, create a new H1 chapter.
-   - If it supplements the previous topic or question, add it as an H2 section under the previous chapter.
+   - If it supplements a previous topic or question, add it under that topic with a heading level one deeper than the parent heading.
 
 5. Append or update the markdown file.
    - If the user says “追加”, append to the end.
@@ -52,9 +52,19 @@ Use this structure by default:
 ## 补充点或子问题
 
 内容总结。
+
+### 对上面 H2 小节的进一步补充
+
+内容总结。
 ```
 
-Do not create excessive heading levels. Prefer H1 and H2 unless the content needs a short list.
+When appending a topic under an existing section, increment the heading level relative to the parent:
+
+- Under `# H1`, use `## H2`.
+- Under `## H2`, use `### H3`.
+- Under `### H3`, use `#### H4`.
+
+Do not create excessive heading levels. Prefer the shallowest level that accurately represents the parent-child relationship.
 
 ## Writing Style
 
