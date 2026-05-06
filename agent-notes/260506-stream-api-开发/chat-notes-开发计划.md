@@ -46,7 +46,7 @@
 - `simple_moss/simple_app_onnx.py`：入口、初始化、warmup、ONNX stream adapter。
 - `simple_moss/api_facade.py`：本地 `start` / `audio` / `status` / `result` / `close` 五接口语义。
 - `simple_moss/simple_onnx_tts_runtime.py`：TTS 业务预处理。
-- `simple_moss/simple_ort_cpu_runtime.py`：ONNX 推理和 codec stream decode，保留当前 CUDA provider。
+- `simple_moss/simple_ort_cpu_runtime.py`：ONNX 推理和 codec stream decode，保留当前 CUDA provider。 —— 修改：这里的文件名，应该改为 simple_ort_gpu_runtime.py。
 
 ---
 
@@ -66,12 +66,44 @@
 **需要完全去掉：**
 
 - `get_model`（若新的 warmup 不再复用 `app.py.WarmupManager` 兼容接口）—— 条件已确认，可以去掉。
-- `split_voice_clone_text` 包装方法（除非 facade 仍想通过 adapter 预先算 chunks）
+- `split_voice_clone_text` 包装方法（除非 facade 仍想通过 adapter 预先算 chunks） —— 保留原先的 /start 逻辑，这个方法需要保留。
 - `synthesize` 非流式接口
 - `_render_index_html_onnx`
 - `parse_args`、`main`
 - `uvicorn`、`legacy_app` 注入、HTML 替换、VSCODE root path、`share` 参数相关逻辑
 - `OnnxRequestRuntimeManager` 中的多 runtime / cpu_threads 缓存逻辑可整体不迁移；新 facade 用单实例锁即可
+
+#### `OnnxRequestRuntimeManager` 补充说明：`cpu_threads` 与单实例锁
+
+当前 ONNX 版本里的 `cpu_threads` 不是严格意义上的代码内写死，但默认行为接近于固定为 1：
+
+- `app_onnx.py` 的启动参数 `--cpu-threads` 默认值是 `1`。
+- 启动时该值会传给 `OnnxNanoTTSServiceAdapter`，再传到 `OnnxTtsRuntime` / `OrtCpuRuntime`，最终用于创建 ONNX `InferenceSession` 时设置 `intra_op_num_threads`。
+- ONNX Session 创建完成后，线程配置基本就随这个 runtime 固定下来。
+- 原前端或 `/api/generate-stream/start` 请求里虽然仍可传 `cpu_threads`，但在当前 ONNX 版本中，请求级 `cpu_threads` 实际不会改变底层 runtime。
+
+原因是 `OnnxRequestRuntimeManager._build_runtime_locked(...)` 当前为了避免重复加载第二套 ONNX Session，会忽略与默认 runtime 不同的 `cpu_threads` 请求，并继续复用 `default_runtime`。也就是说，类里看起来有 `_cpu_runtimes` 这样的 runtime 缓存字典，但当前实际行为并不是“按不同线程数创建多个 runtime”，而是“始终复用同一个默认 ONNX runtime”。
+
+因此迁移到 `simple_moss` 时，不需要保留这套多 runtime / cpu_threads 缓存结构。新 facade 可以只创建一个 ONNX runtime 实例，并用一把执行锁保护它：
+
+```text
+MossStreamApiFacade.start(...)
+  -> 创建 StreamingJob
+  -> 启动后台线程
+  -> 后台线程进入 MossStreamFacade.stream_generate(...)
+  -> 获取 execution_lock
+  -> 独占使用同一个 ONNX runtime 直到本次生成结束
+```
+
+这里的“单实例锁”不是指第二个请求不处理，而是指第二个请求排队等待：
+
+- 第一个 `start` 创建任务 A，后台线程 A 拿到执行锁，开始真实 ONNX 推理并持续产出音频。
+- 第二个 `start` 创建任务 B，接口仍可以立即返回新的 `stream_id`。
+- 后台线程 B 启动后会阻塞在同一把执行锁上，等待任务 A 完成。
+- 在等待期间，任务 B 的 `status` 可以返回已创建 / 等待中 / running 之类的状态，但 `audio` 暂时不会产出真实 PCM。
+- 任务 A 完成释放锁后，任务 B 才进入真实推理，随后开始向自己的 audio queue 写入音频。
+
+这与原代码行为一致：原来的 `OnnxRequestRuntimeManager.iter_with_runtime(...)` 内部也是通过 `_execution_lock` 保证同一时刻只有一个推理任务使用 ONNX runtime。区别只是：旧代码为了兼容 PyTorch 版 `app.py` 的设备路由和 `cpu_threads` 表单参数，保留了一层较复杂的 manager；新 `simple_moss` 可以把它收窄成“单 runtime + 单 execution lock + job queue/线程”的简单模型。
 
 **需要修改 / 收窄：**
 
@@ -119,7 +151,7 @@
 **需要修改 / 收窄：**
 
 - `_run_streaming_job`：去掉 `prompt_audio_path` / `prompt_audio_display_path` / `prompt_audio_cleanup_path`；固定 preset 后 `_stream_factory` 传 `voice=None, prompt_audio_path=None`；去掉 `tts_max_batch_size` / `codec_max_batch_size`；去掉 `requested_execution_device` / `cpu_threads` / `_resolve_attn_for_runtime`；保留 event 消费、PCM 转换、状态更新、audio queue、result 写入、异常、sentinel
-- `StreamingJob.final_result`：可保留旧含义；若不写 WAV/base64，结果可只含 `run_status`、`text_chunks`、`sample_rate`、`channels`、`audio_chunk_ranges`、`emitted_audio_seconds` 等
+- `StreamingJob.final_result`：可保留旧含义；若不写 WAV/base64，结果可只含 `run_status`、`text_chunks`、`sample_rate`、`channels`、`audio_chunk_ranges`、`emitted_audio_seconds` 等 —— 已确认，不需要WAV/base64。
 - 五接口不迁移为 HTTP，而迁移为本地方法
 
 **需要新增：**
@@ -152,7 +184,7 @@
 - `_ensure_text_normalizer`、`prepare_synthesis_text`
 - `_load_reference_audio`、`encode_reference_audio`
 - `decode_full_audio_safe`、`synthesize_single_chunk`、`synthesize`
-- `_write_waveform_to_wav`（若新 `result()` 不再返回最终 WAV/base64）
+- `_write_waveform_to_wav`（若新 `result()` 不再返回最终 WAV/base64） —— 已经确认，不返回最终 WAV/base64。
 - 随上述删除：`torch`、`torchaudio`、`prepare_tts_request_texts`、`WeTextProcessingManager` 等不再需要的依赖
 
 **需要修改 / 收窄：**
@@ -166,6 +198,14 @@
 
 - `resolve_builtin_voice_prompt_audio_codes(voice: str | None) -> list[list[int]]`（收窄后的清晰入口，可选）
 - 可选 `get_codec_audio_format() -> tuple[int, int]`（`sample_rate` / `channels`）
+
+#### 三个新增项的作用说明
+
+- `resolve_fixed_prompt_audio_codes()`：固定 preset voice 专用入口。简化版只使用固定内置音色时，上层不再需要传 `voice` / `prompt_audio_path` 或保留动态分支；该方法内部可直接使用固定音色常量，再通过 `list_builtin_voices()` 从 manifest 查到对应 prompt audio codes。
+- `resolve_builtin_voice_prompt_audio_codes(voice: str | None) -> list[list[int]]`：只支持内置 voice 的收窄入口，用来替代原来更宽的 `resolve_prompt_audio_codes(voice, prompt_audio_path)`。它不再处理 `prompt_audio_path -> encode_reference_audio` 的上传音频 / 克隆音色路径；如果 `voice is None`，可以回退到默认内置音色。
+- `get_codec_audio_format() -> tuple[int, int]`：向 facade 暴露底层 codec 的 PCM 格式元数据，例如 `sample_rate` 和 `channels`。这样 `MossStreamApiFacade.start()` / `status()` / `result()` 不需要硬编码音频格式；如果底层 ONNX codec 输出格式变化，上层只需要读取 runtime 暴露的格式。
+
+这三个新增项都属于“收窄后更清晰的薄封装”，不改变核心推理算法；主要目的是让 `api_facade.py` 与 runtime 的调用关系更直观。
 
 ---
 
@@ -186,8 +226,8 @@
 
 **按实际采样模式决定是否保留：**
 
-- 若只保留当前默认 fixed ONNX 路径：可去掉 `_argmax`、`_apply_repetition_penalty`、`_argmax_with_repetition_penalty`、`_softmax`、`_sample_assistant_text_token`、`_sample_audio_token` 及 `run_local_decoder`、`create_empty_local_cached_past`、`run_local_cached_step`、`run_local_greedy_frame`、`slice_audio_channel_logits`
-- 若仍保留 full/greedy 含义：上述须保留
+- 若只保留当前默认 fixed ONNX 路径：可去掉 `_argmax`、`_apply_repetition_penalty`、`_argmax_with_repetition_penalty`、`_softmax`、`_sample_assistant_text_token`、`_sample_audio_token` 及 `run_local_decoder`、`create_empty_local_cached_past`、`run_local_cached_step`、`run_local_greedy_frame`、`slice_audio_channel_logits` —— 确认，只跑fixed ONNX。
+- 若仍保留 full/greedy 含义：上述须保留 —— 不保留 full/greedy。
 
 **需要完全去掉：**
 
@@ -197,8 +237,8 @@
 **需要修改 / 收窄：**
 
 - `_session`：保留 `CUDAExecutionProvider` 与 `ORT_ENABLE_BASIC`，不要退回 CPU
-- `_create_sessions`：只加载 stream 必需：`prefill`、`decode`、`local_fixed_sampled_frame`、`codec_decode_step`；若保留 greedy/full 再加载对应 optional session
-- `generate_audio_frames`：若只保留 fixed，可删 greedy/full/local_decoder fallback；fixed 分支、decode KV 更新、`on_frame`、GPU arena shrinkage 保持原逻辑
+- `_create_sessions`：只加载 stream 必需：`prefill`、`decode`、`local_fixed_sampled_frame`、`codec_decode_step`；若保留 greedy/full 再加载对应 optional session —— 不保留 full/greedy。
+- `generate_audio_frames`：若只保留 fixed，可删 greedy/full/local_decoder fallback；fixed 分支、decode KV 更新、`on_frame`、GPU arena shrinkage 保持原逻辑 —— 确认，只跑fixed ONNX。
 - `warmup`：保留 builtin voice + text sample + `generate_audio_frames` + `codec_streaming_session.run_frames`
 
 ---
