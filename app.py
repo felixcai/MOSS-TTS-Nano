@@ -352,6 +352,12 @@ class RequestRuntimeManager:
     # 在 ONNX 模式下此方法由 OnnxRequestRuntimeManager.iter_with_runtime 实现，
     # 负责获取 runtime 实例 + 排他执行锁，并对 factory(runtime) 生成器的每个 yield item 转发
     def iter_with_runtime(
+        self,
+        *,
+        requested_execution_device: str | None,
+        cpu_threads: int | None,
+        factory: Callable[[NanoTTSService], Iterator[T]],
+    ) -> Iterator[tuple[T, str, int | None]]:
         runtime, execution_device = self.resolve_runtime(requested_execution_device)
         if runtime.device.type != "cpu":
             for item in factory(runtime):
