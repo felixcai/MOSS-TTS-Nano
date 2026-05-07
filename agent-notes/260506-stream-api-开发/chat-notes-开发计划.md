@@ -253,6 +253,463 @@ MossStreamApiFacade.start(...)
 
 **分工：** `app_onnx.py` 负责「怎么生成」；`onnx_tts_runtime.py` + `ort_cpu_runtime.py` 负责「模型推理」；`api_facade.py` 负责「本地模拟原五接口协议」；从 `app.py` 只筛出 job 管理与 stream job 消费逻辑，不保留 HTTP/UI/Demo 层。
 
+### `simple_moss` 流式类关系说明
+
+当前 `simple_moss` 中与本地流式调用相关的核心类可以分成三层：
+
+```text
+最外层本地 API 层
+MossStreamApiFacade
+  ├─ 持有 StreamingJobManager
+  └─ 持有 MossStreamFacade
+
+任务状态层
+StreamingJobManager
+  └─ 管理多个 StreamingJob
+
+推理执行层
+MossStreamFacade
+  └─ 持有 OnnxNanoTTSServiceAdapter
+        └─ 持有 OnnxTtsRuntime
+              └─ 持有 OrtCpuRuntime / ONNX sessions
+```
+
+- `OnnxNanoTTSServiceAdapter`：真正执行 TTS 推理适配的类，内部持有 `OnnxTtsRuntime`。它负责初始化 ONNX runtime、执行 warmup、拆分文本 chunk、构造 request rows、调用 `generate_audio_frames`、调用 codec streaming decode，并通过 `synthesize_stream(...)` 持续产出 `audio` / `result` 事件。
+- `MossStreamFacade`：推理串行锁包装层，持有 `OnnxNanoTTSServiceAdapter` 和 `_execution_lock`。它的职责不是生成音频，而是保证同一时刻只有一个 stream generation 真正进入底层 ONNX runtime。
+- `StreamingJob`：一次流式请求的任务状态对象，保存 `stream_id`、`audio_queue`、`state`、`run_status`、`error`、音频进度、`text_chunks`、`final_result` 等信息。它本身不执行推理，只记录一次请求的状态和待消费音频队列。
+- `StreamingJobManager`：`StreamingJob` 的线程安全注册表，维护 `stream_id -> StreamingJob` 的映射，负责 `create()`、`get()`、`close()`、`delete()`。
+- `MossStreamApiFacade`：对外暴露的本地五接口门面，提供 `start(text)`、`audio(stream_id)`、`status(stream_id)`、`result(stream_id)`、`close(stream_id)`。它一边通过 `StreamingJobManager` 管理任务，一边通过 `MossStreamFacade` 把生成请求交给底层 adapter。
+
+一次完整调用流程：
+
+```text
+1. 调用 MossStreamApiFacade.start(text)
+2. StreamingJobManager.create() 创建 StreamingJob，返回 stream_id
+3. MossStreamApiFacade 启动后台线程 _run_streaming_job(job, stream_facade, params)
+4. 后台线程调用 MossStreamFacade.stream_generate(...)
+5. MossStreamFacade 获取 _execution_lock，独占底层 ONNX runtime
+6. MossStreamFacade 调用 OnnxNanoTTSServiceAdapter.synthesize_stream(...)
+7. adapter 生成 audio/result 事件
+8. _run_streaming_job 将 audio 事件转为 PCM bytes，写入 job.audio_queue
+9. 调用方通过 MossStreamApiFacade.audio(stream_id) 消费 PCM bytes
+10. result 事件到达后，_run_streaming_job 写入 job.final_result 并向 audio_queue 放入 None 结束标记
+11. 调用方通过 result(stream_id) 获取最终结果，通过 close(stream_id) 清理任务
+```
+
+一句话总结：`OnnxNanoTTSServiceAdapter` 负责“生成”；`MossStreamFacade` 负责“串行化生成”；`StreamingJob` 负责“保存一次任务的状态和音频队列”；`StreamingJobManager` 负责“按 `stream_id` 管理任务”；`MossStreamApiFacade` 负责“把这些能力包装成本地五接口”。
+
+#### 当前 `simple_moss` 会创建的 ONNX sessions
+
+当前 `simple_moss/simple_ort_gpu_runtime.py` 的 `_create_sessions()` 只会创建 4 个 `onnxruntime.InferenceSession`：
+
+```text
+OrtCpuRuntime._create_sessions()
+  ├─ sessions["prefill"]              -> moss_tts_prefill.onnx
+  ├─ sessions["decode"]               -> moss_tts_decode_step.onnx
+  ├─ sessions["local_fixed_sampled_frame"]
+  │                                    -> moss_tts_local_fixed_sampled_frame.onnx
+  └─ sessions["codec_decode_step"]     -> codec 目录中的 decode_step onnx
+```
+
+这 4 个 session 的职责：
+
+- `prefill`：第一次把完整 prompt / text / reference audio codes 输入 TTS global transformer，生成初始 `global_hidden` 和 KV cache。
+- `decode`：每生成一帧声学 token 后，更新 global transformer 的 `global_hidden` 和 KV cache，为下一帧生成推进上下文。
+- `local_fixed_sampled_frame`：当前 fixed 模式下的单帧声学 token 生成器，一次生成一整帧 audio codebook token。
+- `codec_decode_step`：将声学 token 帧流式解码为真实音频 waveform。
+
+当前 `simple_moss` 不会创建以下 session：
+
+- `local_decoder`
+- `local_cached_step`
+- `local_greedy_frame`
+- `codec_encode`
+- `codec_decode_full`
+
+虽然 `tts_browser_onnx_meta.json` 中仍记录了 `local_decoder`、`local_cached_step`、`local_fixed_sampled_frame`，但简化后的 `_create_sessions()` 只读取并加载 `local_fixed_sampled_frame`，因此初始化阶段主要内存增长对应的就是上述 4 个 session。
+
+#### `prefill` 与 `decode` 是否可以省略
+
+在当前 ONNX 流式生成架构中，`prefill` 和 `decode` 基本都不能省略。
+
+`prefill` 是开头的一次性上下文初始化：
+
+```text
+完整 prompt / text / reference audio codes
+  -> prefill ONNX
+  -> 初始 global_hidden
+  -> 初始 KV cache
+```
+
+如果没有 `prefill`，模型不知道当前要合成什么文本、使用什么参考音色，也没有第一帧生成所需的 `global_hidden` 和 KV cache。
+
+`decode` 是每帧后的上下文推进：
+
+```text
+上一帧 audio token + past KV cache
+  -> decode ONNX
+  -> 下一步 global_hidden
+  -> 更新后的 KV cache
+```
+
+整体循环可以理解为：
+
+```text
+prefill 得到 global_hidden_0
+  -> local_fixed_sampled_frame 生成 frame_0
+  -> decode(frame_0) 得到 global_hidden_1
+  -> local_fixed_sampled_frame 生成 frame_1
+  -> decode(frame_1) 得到 global_hidden_2
+  -> ...
+```
+
+如果没有 `decode`，`global_hidden` 不会随着已生成音频更新，后续每一帧都会基于同一个旧上下文生成，无法形成正常连续语音。因此当前架构里：
+
+- `prefill` 负责“初始化上下文”；
+- `decode` 负责“每帧后推进上下文”；
+- `local_fixed_sampled_frame` 负责“根据当前上下文生成一帧声学 token”；
+- `codec_decode_step` 负责“把声学 token 解码成 waveform”。
+
+#### `test_local_api.py` 日志中的 RTF 与内存观测
+
+一次 `python -m simple_moss.test_local_api` 测试日志中，生成文本为：
+
+```text
+你好，这是一段来自 simple_moss 的本地合成测试语音。
+```
+
+生成结果核心指标：
+
+```text
+audio_chunks=18
+total_audio_s=6.880
+first_audio_latency_s=0.5643
+rtf_first=1.7580
+rtf_steady=0.6755
+elapsed=5.01s
+```
+
+RTF 结论：
+
+- 首帧延迟约 `0.564s`，从 `start` 到第一段 PCM 到达约半秒。
+- `rtf_first=1.7580`，首段生成慢于实时，主要包含 prefill、首次 decode、codec 启动等冷启动开销。
+- `rtf_steady=0.6755`，稳定生成阶段快于实时（RTF < 1）。
+- 整体 RTF 约为 `5.01 / 6.88 = 0.73`，即生成 6.88 秒音频实际耗时约 5.01 秒，整体仍快于实时。
+
+按 `sys_used` 观察系统内存消耗（不是单进程精确 RSS，也不是 GPU 显存）：
+
+```text
+初始化开始:        11561 MB
+初始化完成:        12885 MB
+warmup 开始:       12885 MB
+warmup 完成:       13567 MB
+真实生成完成:      13869 MB
+```
+
+分阶段估算：
+
+- 初始化阶段增长约 `12885 - 11561 = 1324 MB`，主要发生在创建 ONNX sessions：`prefill`、`decode`、`local_fixed_sampled_frame`、`codec_decode_step`。
+- warmup 阶段增长约 `13567 - 12885 = 682 MB`，主要来自第一次 prefill / decode / codec run 后的运行时缓存、Arena、临时张量等。
+- 真实 stream 生成阶段增长约 `13869 - 13567 = 302 MB`。
+- 从进程开始到本次日志峰值，系统已用内存总增长约 `13869 - 11561 = 2308 MB`，约 2.3 GB。
+
+补充说明：`sys_used` 是整机系统内存已用量，会受到其他进程、系统缓存和内存回收影响。若看当前 Python 进程 RSS，本次日志从约 `50.8 MB` 增长到约 `801.7 MB`，进程 RSS 增长约 `751 MB`。
+
+#### PyTorch 与 ONNX 模型大小、内存和拆图原理
+
+从静态文件大小看，当前模型资产大致呈现：
+
+```text
+PyTorch:
+  pytorch_model.bin ≈ 229 MB
+
+ONNX:
+  moss_tts_global_shared.data ≈ 430 MB
+  moss_tts_local_shared.data  ≈ 224 MB
+  另有多个 .onnx 小图
+```
+
+因此存在一种合理可能：**PyTorch 版本在常驻权重文件层面更小，ONNX 版本因为多图拆分和外部权重数据而更占内存**。但不能只通过磁盘文件大小直接判断运行时内存，因为运行时还包含：
+
+- ONNX Runtime / PyTorch 的图结构与优化缓存；
+- CUDA provider / CUDA allocator 的内部缓存；
+- memory arena / 临时张量 / workspace；
+- KV cache；
+- 是否 FP32 / FP16；
+- 多个 ONNX session 是否重复持有或映射部分权重；
+- warmup 后运行时缓存是否常驻。
+
+在当前 `simple_moss` 中，ONNX 不是加载一个大模型，而是加载多个 session：
+
+```text
+prefill
+decode
+local_fixed_sampled_frame
+codec_decode_step
+```
+
+每个 session 都可能有自己的图优化结构、内存 arena 和执行缓存。因此在这个项目当前形态下，ONNX 版本更像是“为推理速度和部署便利做了多图拆分”，不一定追求最小内存占用。
+
+ONNX 拆成多个 session 的原理是：原始流式 TTS 推理流程中存在多个“输入输出形态不同、调用频率不同、优化目标不同”的阶段，拆开后可以分别优化和调度：
+
+```text
+text / prompt
+  -> prefill
+  -> 循环 N 次：
+       local_fixed_sampled_frame
+       decode
+  -> 每积累若干帧：
+       codec_decode_step
+  -> waveform
+```
+
+- `prefill`：处理完整上下文，输入是长序列，输出初始 `global_hidden` 和 KV cache。
+- `decode`：后续每步只处理一个新 frame row，输入包含 `past_key/value`，输出下一步 `global_hidden` 和更新后的 KV cache。
+- `local_fixed_sampled_frame`：根据当前 `global_hidden` 一次生成一整帧声学 token，并把 top-k / top-p / repetition penalty / 随机采样逻辑固化到 ONNX 图内。
+- `codec_decode_step`：属于 codec 子系统，将声学 token 流式解码为 waveform，并维护自己的 streaming cache。
+
+这种拆分适合流式输出：外层 Python 可以控制何时解码 codec、每次解码多少帧、如何平衡首帧延迟与吞吐、如何中途停止，以及如何把音频块放入 queue。但代价是 session 数变多、图优化结构和内存 arena 变多，模型资产和运行时内存可能增大。
+
+PyTorch 也支持 stream 生成，但它通常不需要把磁盘模型文件拆成多个文件。原因是：**PyTorch 的“拆分”发生在 Python 动态控制流里，ONNX 的“拆分”发生在导出的静态图文件里。**
+
+PyTorch 侧通常是：
+
+```text
+pytorch_model.bin          权重
+modeling_moss_tts_nano.py  模型结构和生成逻辑
+```
+
+代码运行时可以灵活调用不同子模块：
+
+```text
+self.transformer(...)          -> global / prefill / decode 逻辑
+self.local_transformer(...)    -> local frame generation
+self.audio_lm_heads[...]       -> audio token logits
+sample                         -> 采样
+codec decode                   -> waveform
+yield audio event              -> 流式输出
+```
+
+因此 PyTorch 文件看起来是一个权重文件，但运行逻辑仍然是分阶段的；ONNX 为了让静态图可部署、可重复调用、便于流式调度，通常会把这些阶段导出成多个 ONNX graph / session。
+
+严谨比较 PyTorch 与 ONNX 的内存占用，需要分别测量：
+
+```text
+PyTorch 初始化后 RSS / GPU 显存
+PyTorch warmup 后 RSS / GPU 显存
+PyTorch 一次生成后 RSS / GPU 显存
+
+ONNX 初始化后 RSS / GPU 显存
+ONNX warmup 后 RSS / GPU 显存
+ONNX 一次生成后 RSS / GPU 显存
+```
+
+仅看文件大小只能说明“当前 ONNX 资产更大”，不能直接等价为“ONNX 运行时一定更耗内存”。但在当前多 session、双 `.data` 外部权重文件的形态下，ONNX 版本更耗内存是合理且需要重点观察的风险点。
+
+---
+
+# `simple_moss` 外部参数与实际生效情况
+
+本章节整理当前 `simple_moss/test_local_api.py`、`simple_moss/simple_app_onnx.py`、`simple_moss/api_facade.py` 中可以由外部调用方传入的参数，并标注这些参数是否真正影响到底层 ONNX 执行。
+
+## 当前 CLI 暴露的参数
+
+`python -m simple_moss.test_local_api` 当前通过 argparse 直接暴露 4 个参数：
+
+| 参数                 | 默认值                                | 用途                                          | 传到哪里                                                     | 是否影响底层                 |
+| ------------------ | ----------------------------------:| ------------------------------------------- | -------------------------------------------------------- | ---------------------- |
+| `--model-dir`      | `None`                             | ONNX 模型目录；`None` 时由 runtime 默认解析到 `models/` | `create_default_adapter(model_dir=...)`                  | 是                      |
+| `--text`           | `你好，这是一段来自 simple_moss 的本地合成测试语音。` | 要合成的文本                                      | `facade.start(text)`                                     | 是                      |
+| `--output`         | `simple_moss_test_output.wav`      | 输出 WAV 文件路径                                 | `_write_pcm_to_wav(...)`                                 | 否，只影响测试脚本保存路径          |
+| `--max-new-frames` | `375`                              | 每个 text chunk 最多生成多少声学 token 帧              | `create_default_adapter(...)`、`MossStreamApiFacade(...)` | 是，但 warmup 阶段会被临时改成 16 |
+
+当前 `test_local_api.py` 中还有一项重要参数没有通过 CLI 暴露，而是写死在代码里：
+
+```python
+facade = MossStreamApiFacade(
+    adapter,
+    max_new_frames=max_new_frames,
+    voice_clone_max_text_tokens=16,
+)
+```
+
+因此 `voice_clone_max_text_tokens` 当前对 stream generate 有效，但不能通过命令行传入。
+
+## 初始化阶段参数
+
+测试脚本初始化阶段调用：
+
+```python
+adapter = create_default_adapter(
+    model_dir=model_dir,
+    cpu_threads=1,
+    max_new_frames=max_new_frames,
+)
+```
+
+`create_default_adapter(...)` 实际支持：
+
+| 参数               | 默认值    | 当前 test 是否暴露 | 是否影响底层  | 说明                                                                     |
+| ---------------- | ------:| ------------ | ------- | ---------------------------------------------------------------------- |
+| `model_dir`      | `None` | 是            | 是       | 决定加载哪个 ONNX 模型目录                                                       |
+| `output_dir`     | `None` | 否            | 影响有限    | 决定 adapter 输出目录；当前 result 不写 WAV/base64，主要是路径元数据/目录准备                  |
+| `cpu_threads`    | `1`    | 否，写死为 1      | 有效但影响有限 | 写入 ORT `intra_op_num_threads`，主要影响 CPU ops / ORT 内部线程，CUDA 主计算不一定明显受影响 |
+| `max_new_frames` | `375`  | 是            | 是       | 写入 manifest 默认生成帧上限；stream 阶段会使用，warmup 阶段会临时覆盖为 16                    |
+
+## Warmup 阶段参数
+
+测试脚本 warmup 阶段调用：
+
+```python
+warmup_result = warmup_runtime(adapter)
+```
+
+当前 `warmup_runtime(adapter)` 只接受已创建的 `adapter`，没有额外参数。继续往下，`adapter.warmup()` 当前也没有外部可传参数。
+
+warmup 当前固定行为：
+
+- 固定使用 `FIXED_BUILTIN_VOICE`，当前为 `"Lingyu"`。
+- 调用 `OrtCpuRuntime.warmup(voice_name=voice_name)`。
+- 使用 manifest 中第一条 `text_samples` 的 `text_token_ids`。
+- 不走 `split_voice_clone_text(...)`，因此没有 `voice_clone_max_text_tokens` / `max_text_chunk_size` 概念。
+- 临时将 `manifest["generation_defaults"]["max_new_frames"]` 改成 `16`，warmup 结束后恢复原值。
+
+因此，**warmup 阶段当前没有可以由 test 外部直接传入的参数**。外部传入的 `max_new_frames` 不决定 warmup 生成帧数；warmup 内部固定最多生成 16 帧。
+
+## Stream Generate 阶段参数
+
+### `MossStreamApiFacade.__init__` 默认参数
+
+`MossStreamApiFacade(adapter, ...)` 会保存一组默认生成参数，供后续 `start(...)` 在未显式传参时使用：
+
+| 参数                            | 默认值               | 当前 test 是否暴露     | 当前实际效果                                                         |
+| ----------------------------- | -----------------:| ---------------- | -------------------------------------------------------------- |
+| `adapter`                     | 必填                | 内部创建             | 有效，底层推理 adapter                                                |
+| `max_new_frames`              | `375`             | 是                | 有效，控制每个 text chunk 生成帧上限                                       |
+| `voice_clone_max_text_tokens` | `75`              | 否，当前 test 写死为 16 | 有效，控制文本切 chunk                                                 |
+| `attn_implementation`         | `"model_default"` | 否                | 不建议改；当前用于解析 sample_mode                                        |
+| `do_sample`                   | `True`            | 否                | 不建议改；`False` 可能映射到 greedy，当前 fixed-only 路径可能失效                 |
+| `text_temperature`            | `1.0`             | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `text_top_p`                  | `1.0`             | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `text_top_k`                  | `50`              | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `audio_temperature`           | `0.8`             | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `audio_top_p`                 | `0.95`            | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `audio_top_k`                 | `25`              | 否                | 当前 fixed ONNX 路径基本不生效                                          |
+| `audio_repetition_penalty`    | `1.2`             | 否                | 当前 fixed ONNX 路径基本不生效；只传 `repetition_seen_mask`，不传动态 penalty 值 |
+| `seed`                        | `None`            | 否                | 有效，重置 Python RNG，影响传给 `local_fixed_sampled_frame.onnx` 的随机数    |
+
+### `MossStreamApiFacade.start(...)` 单次请求参数
+
+`start(...)` 支持在单次请求级别覆盖 facade 默认参数：
+
+```python
+facade.start(
+    text,
+    max_new_frames=...,
+    voice_clone_max_text_tokens=...,
+    attn_implementation=...,
+    do_sample=...,
+    text_temperature=...,
+    text_top_p=...,
+    text_top_k=...,
+    audio_temperature=...,
+    audio_top_p=...,
+    audio_top_k=...,
+    audio_repetition_penalty=...,
+    seed=...,
+)
+```
+
+当前测试脚本只调用：
+
+```python
+start_resp = facade.start(text)
+```
+
+因此实际使用的是 `MossStreamApiFacade.__init__` 中保存的默认值。
+
+## 参数实际生效分类
+
+### 实际有效，值得外部暴露
+
+这些参数当前确实影响底层执行或输出：
+
+| 参数                            | 生效原因                                                                                    |
+| ----------------------------- | --------------------------------------------------------------------------------------- |
+| `model_dir`                   | 决定加载哪个 ONNX 模型资产                                                                        |
+| `cpu_threads`                 | 设置 ORT `intra_op_num_threads`，对 CPU ops / ORT 内部线程可能有影响                                 |
+| `max_new_frames`              | `generate_audio_frames` 循环上限，控制每个 text chunk 最多生成多少声学 token 帧                           |
+| `voice_clone_max_text_tokens` | 传入 `split_voice_clone_text(..., max_tokens=...)`，影响文本切 chunk、prefill 长度、chunk 数、首帧延迟和内存 |
+| `seed`                        | 重置 `self.runtime.rng`，影响传入 fixed ONNX 的 `assistant_random_u` / `audio_random_u`         |
+| `text`                        | 输入文本，直接决定合成内容                                                                           |
+| `output` / `output_wav`       | 只影响测试脚本最终 WAV 保存路径，不影响模型推理                                                              |
+| `output_dir`                  | 影响 adapter 输出目录，当前生成结果不落 WAV/base64，推理影响有限                                              |
+
+### 形式上可传，但当前 fixed-only 路径基本不生效
+
+这些参数会被 `_apply_generation_options(...)` 写入 `runtime.manifest["generation_defaults"]`，但当前 `simple_ort_gpu_runtime.py` 只保留 fixed ONNX 路径。
+
+实际调用 `local_fixed_sampled_frame.onnx` 时只传入：
+
+```python
+{
+    "global_hidden": global_hidden,
+    "repetition_seen_mask": repetition_seen_mask,
+    "assistant_random_u": assistant_random_u,
+    "audio_random_u": audio_random_u,
+}
+```
+
+没有把 temperature / top-k / top-p / repetition penalty 作为动态输入传给 ONNX。因此下列参数当前基本不影响底层：
+
+- `text_temperature`
+- `text_top_p`
+- `text_top_k`
+- `audio_temperature`
+- `audio_top_p`
+- `audio_top_k`
+- `audio_repetition_penalty`
+
+这些参数更像原始 full / greedy / Python 采样路径的遗留参数。当前 fixed 模式下，采样策略大概率已经固化在 `moss_tts_local_fixed_sampled_frame.onnx` 中。
+
+### 可能影响流程，但当前不建议外部改动
+
+| 参数                    | 当前行为                                                                       | 风险                                                       |
+| --------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `attn_implementation` | 被当作 `sample_mode` 解析；默认 `"model_default"` + `do_sample=True` 会落到 `"fixed"` | 如果传 `"full"` / `"greedy"`，当前 simple_moss 未保留对应路径，可能不生成音频 |
+| `do_sample`           | 默认 `True` 时走 fixed；`False` 会映射到 greedy                                     | 当前没有 greedy session，可能导致 fixed-only 生成路径失效               |
+
+## 建议
+
+当前最值得暴露为稳定外部参数的是：
+
+```text
+--model-dir
+--text
+--output
+--max-new-frames
+--voice-clone-max-text-tokens
+--seed
+--cpu-threads
+--output-dir
+```
+
+当前不建议暴露或不建议用户随意调整的是：
+
+```text
+attn_implementation
+do_sample
+text_temperature
+text_top_p
+text_top_k
+audio_temperature
+audio_top_p
+audio_top_k
+audio_repetition_penalty
+```
+
+原因是：这些参数要么当前 fixed ONNX 路径不读取，要么改动后可能让 fixed-only 生成路径失效。
+
 ---
 
 *存档日期：2026-05-06*
