@@ -137,12 +137,12 @@ def _resolve_stream_decode_frame_budget(
     """
     lead_seconds = _compute_stream_lead_seconds(emitted_samples_total, sample_rate, first_audio_emitted_at_seconds)
     if not first_audio_emitted_at_seconds or lead_seconds < 0.20:
-        return 8
+        return 6
     if lead_seconds < 0.55:
-        return 8
+        return 6
     if lead_seconds < 1.10:
-        return 8
-    return 12
+        return 6
+    return 8
 
 
 # =============================================================================
