@@ -76,7 +76,7 @@ def run_test(
     log.info("Warmup 完成，耗时 %.2f s", warmup_result.get("elapsed_seconds", time.perf_counter() - t0))
 
     # ── Step 3: 创建 facade ───────────────────────────────────────────
-    facade = MossStreamApiFacade(adapter, max_new_frames=max_new_frames, voice_clone_max_text_tokens=16)
+    facade = MossStreamApiFacade(adapter, max_new_frames=max_new_frames, voice_clone_max_text_tokens=32)
 
     # ── Step 4: start ─────────────────────────────────────────────────
     log.info("=" * 60)
