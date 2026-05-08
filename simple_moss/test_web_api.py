@@ -248,7 +248,7 @@ def _render_index_html(state: WebRuntimeState) -> str:
         <div class="row">
           <div class="field">
             <label for="initial-delay">Initial Playback Delay (s)</label>
-            <input id="initial-delay" type="number" min="0" max="3" step="0.01" value="0.08">
+            <input id="initial-delay" type="number" min="0" max="3" step="0.01" value="0.0">
           </div>
           <div class="field">
             <label>&nbsp;</label>
@@ -339,7 +339,7 @@ def _render_index_html(state: WebRuntimeState) -> str:
       }}
       if (!audioContext) {{
         audioContext = new (window.AudioContext || window.webkitAudioContext)({{ sampleRate }});
-        const delay = Math.max(0, Number(initialDelayInput.value || 0.08));
+        const delay = Math.max(0, Number(initialDelayInput.value || 0.0));
         nextPlaybackTime = audioContext.currentTime + delay;
       }}
       const audioBuffer = pcm16leToAudioBuffer(bytes, sampleRate, channels);
@@ -396,11 +396,7 @@ def _render_index_html(state: WebRuntimeState) -> str:
         const payload = await response.json();
         const chunks = Array.isArray(payload.text_chunks) ? payload.text_chunks : [];
         setRunStatus(
-          (payload.status_text || payload.run_status || payload.state || "Streaming") +
-          "\\nstate=" + payload.state +
-          " | emitted=" + Number(payload.emitted_audio_seconds || 0).toFixed(2) + "s" +
-          " | lead=" + Number(payload.lead_seconds || 0).toFixed(2) + "s" +
-          " | chunks=" + chunks.length
+          payload.status_text || payload.run_status || payload.state || "Streaming"
         );
         if (chunks.length > 0) {{
           playbackScript.textContent = chunks.map((item, index) => (index + 1) + ". " + item).join("\\n");
@@ -572,7 +568,7 @@ def build_app(state: WebRuntimeState) -> FastAPI:
         request: Request,
         text: str = Form(...),
         max_new_frames: int = Form(375),
-        voice_clone_max_text_tokens: int = Form(16),
+        voice_clone_max_text_tokens: int = Form(32),
     ):
         resolved_text = str(text or "").strip()
         if not resolved_text:
@@ -657,7 +653,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None, help="输出目录（默认 generated_audio/）")
     parser.add_argument("--cpu-threads", type=int, default=1, help="ORT CPU 线程数")
     parser.add_argument("--max-new-frames", type=int, default=375, help="最大生成帧数")
-    parser.add_argument("--voice-clone-max-text-tokens", type=int, default=16, help="每个文本 chunk 最大 token 数")
+    parser.add_argument("--voice-clone-max-text-tokens", type=int, default=32, help="每个文本 chunk 最大 token 数")
     parser.add_argument("--skip-warmup", action="store_true", help="跳过启动 warmup")
     return parser.parse_args(argv)
 
