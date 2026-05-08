@@ -192,6 +192,7 @@ class OnnxNanoTTSServiceAdapter:
         audio_top_k: int = 25,
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
+        chunk_pause_seconds: float = 2.0,
     ) -> Iterator[dict[str, object]]:
         """在后台线程中启动流式 TTS 推理，通过 Generator 逐步 yield 音频事件和结果事件。
 
@@ -357,7 +358,10 @@ class OnnxNanoTTSServiceAdapter:
                         break
 
                     if chunk_index < len(text_chunks) - 1:
-                        pause_seconds = self.runtime.estimate_voice_clone_inter_chunk_pause_seconds(chunk_text)
+                        pause_seconds = self.runtime.estimate_voice_clone_inter_chunk_pause_seconds(
+                            chunk_text,
+                            chunk_pause_seconds=chunk_pause_seconds
+                        )
                         pause_samples = max(0, int(round(sample_rate * pause_seconds)))
                         if pause_samples > 0:
                             pause_waveform = np.zeros((pause_samples, channels), dtype=np.float32)

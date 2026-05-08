@@ -316,6 +316,7 @@ def _run_streaming_job(
     audio_top_k: int,
     audio_repetition_penalty: float,
     seed: int | None,
+    chunk_pause_seconds: float,
 ) -> None:
     """在后台线程中驱动一次完整的流式 TTS 任务：
       - 调用 stream_facade.stream_generate 获取事件迭代器；
@@ -354,6 +355,7 @@ def _run_streaming_job(
             audio_top_k=int(audio_top_k),
             audio_repetition_penalty=float(audio_repetition_penalty),
             seed=seed,
+            chunk_pause_seconds=float(chunk_pause_seconds),
         ):
             t_receive = time.monotonic()
             gen_time_s = t_receive - last_end
@@ -534,6 +536,7 @@ class MossStreamApiFacade:
         audio_top_k: int = 25,
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
+        chunk_pause_seconds: float = 2.0,
     ) -> None:
         """创建 MossStreamFacade 和 StreamingJobManager，保存推理参数默认值。
 
@@ -554,6 +557,7 @@ class MossStreamApiFacade:
             "audio_top_k": audio_top_k,
             "audio_repetition_penalty": audio_repetition_penalty,
             "seed": seed,
+            "chunk_pause_seconds": chunk_pause_seconds,
         }
 
     def start(
@@ -572,6 +576,7 @@ class MossStreamApiFacade:
         audio_top_k: int | None = None,
         audio_repetition_penalty: float | None = None,
         seed: int | None = None,
+        chunk_pause_seconds: float | None = None,
     ) -> dict[str, object]:
         """创建 StreamingJob，在后台 daemon 线程中启动 _run_streaming_job，
         立即返回包含 stream_id 和初始状态的字典（对应原 HTTP /start 接口）。
@@ -594,6 +599,7 @@ class MossStreamApiFacade:
             "audio_top_k": audio_top_k if audio_top_k is not None else self._defaults["audio_top_k"],
             "audio_repetition_penalty": audio_repetition_penalty if audio_repetition_penalty is not None else self._defaults["audio_repetition_penalty"],
             "seed": seed if seed is not None else self._defaults["seed"],
+            "chunk_pause_seconds": chunk_pause_seconds if chunk_pause_seconds is not None else self._defaults["chunk_pause_seconds"],
         }
 
         thread = threading.Thread(

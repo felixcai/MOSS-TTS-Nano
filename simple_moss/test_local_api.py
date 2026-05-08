@@ -57,6 +57,7 @@ def run_test(
     output_wav: str,
     max_new_frames: int,
     voice_clone_max_text_tokens: int,
+    chunk_pause_seconds: float,
 ) -> None:
     # ── Step 1: 初始化 ────────────────────────────────────────────────
     log.info("=" * 60)
@@ -77,7 +78,12 @@ def run_test(
     log.info("Warmup 完成，耗时 %.2f s", warmup_result.get("elapsed_seconds", time.perf_counter() - t0))
 
     # ── Step 3: 创建 facade ───────────────────────────────────────────
-    facade = MossStreamApiFacade(adapter, max_new_frames=max_new_frames, voice_clone_max_text_tokens=voice_clone_max_text_tokens)
+    facade = MossStreamApiFacade(
+        adapter,
+        max_new_frames=max_new_frames,
+        voice_clone_max_text_tokens=voice_clone_max_text_tokens,
+        chunk_pause_seconds=chunk_pause_seconds,
+    )
 
     # ── Step 4: start ─────────────────────────────────────────────────
     log.info("=" * 60)
@@ -187,6 +193,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=32,
         help="每个文本 chunk 最大 token 数（默认 32）",
     )
+    parser.add_argument(
+        "--chunk-pause-seconds",
+        type=float,
+        default=2.0,
+        help="相邻 chunk 之间的静音时长基准（秒），默认 2.0",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,4 +210,5 @@ if __name__ == "__main__":
         output_wav=args.output,
         max_new_frames=args.max_new_frames,
         voice_clone_max_text_tokens=args.voice_clone_max_text_tokens,
+        chunk_pause_seconds=args.chunk_pause_seconds,
     )

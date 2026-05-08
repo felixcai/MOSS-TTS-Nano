@@ -52,6 +52,7 @@ class WebRuntimeState:
     cpu_threads: int
     max_new_frames: int
     voice_clone_max_text_tokens: int
+    chunk_pause_seconds: float
     warmup_result: dict[str, object] | None = None
     warmup_error: str | None = None
 
@@ -79,6 +80,20 @@ def _coerce_int(value: object, default: int, *, minimum: int | None = None, maxi
         result = max(int(minimum), result)
     if maximum is not None:
         result = min(int(maximum), result)
+    return result
+
+
+def _coerce_float(value: object, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """将 HTTP 表单值安全转换为 float，并按需限制上下界。
+    """
+    try:
+        result = float(value)
+    except Exception:
+        result = float(default)
+    if minimum is not None:
+        result = max(float(minimum), result)
+    if maximum is not None:
+        result = min(float(maximum), result)
     return result
 
 
@@ -251,6 +266,12 @@ def _render_index_html(state: WebRuntimeState) -> str:
             <input id="initial-delay" type="number" min="0" max="3" step="0.01" value="0.0">
           </div>
           <div class="field">
+            <label for="chunk-pause-seconds">Chunk Pause (s)</label>
+            <input id="chunk-pause-seconds" type="number" min="0" max="10" step="0.1" value="{state.chunk_pause_seconds}">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
             <label>&nbsp;</label>
             <div class="meta">PCM stream is played in realtime with WebAudio.</div>
           </div>
@@ -290,6 +311,7 @@ def _render_index_html(state: WebRuntimeState) -> str:
     const maxNewFramesInput = document.getElementById("max-new-frames");
     const maxTextTokensInput = document.getElementById("voice-clone-max-text-tokens");
     const initialDelayInput = document.getElementById("initial-delay");
+    const chunkPauseSecondsInput = document.getElementById("chunk-pause-seconds");
     const warmupStatus = document.getElementById("warmup-status");
     const runStatus = document.getElementById("run-status");
     const playbackScript = document.getElementById("playback-script");
@@ -445,6 +467,7 @@ def _render_index_html(state: WebRuntimeState) -> str:
       formData.set("text", textInput.value);
       formData.set("max_new_frames", String(Number(maxNewFramesInput.value || {state.max_new_frames})));
       formData.set("voice_clone_max_text_tokens", String(Number(maxTextTokensInput.value || {state.voice_clone_max_text_tokens})));
+      formData.set("chunk_pause_seconds", String(Number(chunkPauseSecondsInput.value || {state.chunk_pause_seconds})));
 
       generateBtn.disabled = true;
       setRunStatus("Starting...");
@@ -569,6 +592,7 @@ def build_app(state: WebRuntimeState) -> FastAPI:
         text: str = Form(...),
         max_new_frames: int = Form(375),
         voice_clone_max_text_tokens: int = Form(32),
+        chunk_pause_seconds: float = Form(2.0),
     ):
         resolved_text = str(text or "").strip()
         if not resolved_text:
@@ -581,6 +605,12 @@ def build_app(state: WebRuntimeState) -> FastAPI:
                 state.voice_clone_max_text_tokens,
                 minimum=1,
                 maximum=300,
+            ),
+            chunk_pause_seconds=_coerce_float(
+                chunk_pause_seconds,
+                state.chunk_pause_seconds,
+                minimum=0.0,
+                maximum=10.0,
             ),
         )
         stream_id = str(start_response["stream_id"])
@@ -654,6 +684,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=int, default=1, help="ORT CPU 线程数")
     parser.add_argument("--max-new-frames", type=int, default=375, help="最大生成帧数")
     parser.add_argument("--voice-clone-max-text-tokens", type=int, default=32, help="每个文本 chunk 最大 token 数")
+    parser.add_argument("--chunk-pause-seconds", type=float, default=2.0, help="相邻 chunk 之间的静音时长基准（秒）")
     parser.add_argument("--skip-warmup", action="store_true", help="跳过启动 warmup")
     return parser.parse_args(argv)
 
@@ -693,6 +724,7 @@ def main(argv: list[str] | None = None) -> None:
         adapter,
         max_new_frames=max(1, int(args.max_new_frames)),
         voice_clone_max_text_tokens=max(1, int(args.voice_clone_max_text_tokens)),
+        chunk_pause_seconds=max(0.0, float(args.chunk_pause_seconds)),
     )
     state = WebRuntimeState(
         adapter=adapter,
@@ -701,6 +733,7 @@ def main(argv: list[str] | None = None) -> None:
         cpu_threads=max(1, int(args.cpu_threads)),
         max_new_frames=max(1, int(args.max_new_frames)),
         voice_clone_max_text_tokens=max(1, int(args.voice_clone_max_text_tokens)),
+        chunk_pause_seconds=max(0.0, float(args.chunk_pause_seconds)),
         warmup_result=warmup_result,
         warmup_error=warmup_error,
     )

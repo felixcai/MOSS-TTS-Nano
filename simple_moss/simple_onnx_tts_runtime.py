@@ -256,6 +256,30 @@ def _contains_cjk(text: str) -> bool:
     return False
 
 
+def _count_mixed_words(text: str) -> int:
+    """统计混合文本的等效词数：一个 CJK 字符算一个词，连续的外文字母/数字算一个词。
+    用于计算语音停顿时的句子长度估算。
+    """
+    count = 0
+    in_word = False
+    for char in str(text or ""):
+        if (
+            "\u4e00" <= char <= "\u9fff"
+            or "\u3400" <= char <= "\u4dbf"
+            or "\u3040" <= char <= "\u30ff"
+            or "\uac00" <= char <= "\ud7af"
+        ):
+            count += 1
+            in_word = False
+        elif char.isalnum():
+            if not in_word:
+                count += 1
+                in_word = True
+        else:
+            in_word = False
+    return count
+
+
 def _prepare_text_for_sentence_chunking(text: str) -> str:
     """对文本做基础正规化（去多余空白、补全尾部标点），为后续句子切分做准备。
     CJK 文本末尾补"。"，英文短文本前补空格（触发更自然的语音韵律）。
@@ -527,17 +551,26 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             chunks.append(current_chunk.strip())
         return chunks if len(chunks) > 1 else [normalized_text]
 
-    def estimate_voice_clone_inter_chunk_pause_seconds(self, text_chunk: str) -> float:
-        """根据当前 chunk 的词数估算下一个 chunk 前应插入的静音时长（秒）。
-        短句（≤4词）后插入较长静音，长句后插入较短静音。
+    def estimate_voice_clone_inter_chunk_pause_seconds(
+        self,
+        text_chunk: str,
+        chunk_pause_seconds: float = DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS
+    ) -> float:
+        """根据当前 chunk 的长度估算下一个 chunk 前应插入的静音时长（秒）。
+        短句（混合词数≤8）后插入较短静音 (chunk_pause_seconds / 2.0)，长句后插入配置的静音。
 
         调用方：simple_app_onnx.py 的 _worker 闭包，用于在相邻 text_chunk 之间生成自然的停顿静音。
         """
-        word_count = len([item for item in str(text_chunk or "").strip().split() if item])
+        text = str(text_chunk or "").strip()
+        if not text:
+            return float(chunk_pause_seconds) / 2.0
+            
+        word_count = _count_mixed_words(text)
+
         return (
-            DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS
-            if word_count <= 4
-            else DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS
+            float(chunk_pause_seconds) / 2.0
+            if word_count <= 8
+            else float(chunk_pause_seconds)
         )
 
     def resolve_prompt_audio_codes(
