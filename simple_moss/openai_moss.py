@@ -24,8 +24,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ._config import DEFAULT_VOICE_CONFIG
 from .api_facade import MossStreamApiFacade
-from .simple_app_onnx import FIXED_BUILTIN_VOICE, create_default_adapter, warmup_runtime
+from .simple_app_onnx import create_default_adapter, warmup_runtime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -155,7 +156,7 @@ def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastA
     @app.get("/v1/audio/voices")
     async def list_voices():
         """List available voices."""
-        voice_name = str(FIXED_BUILTIN_VOICE) if FIXED_BUILTIN_VOICE else "default"
+        voice_name = str(DEFAULT_VOICE_CONFIG.default_voice or "default")
         voices = [TTSVoice(id="default", name=voice_name, language="Chinese")]
         return {"voices": [v.model_dump() for v in voices]}
 
@@ -168,7 +169,7 @@ def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastA
 
         Fields voice, response_format, and speed are accepted for API
         compatibility but have no effect; the ONNX model always uses
-        FIXED_BUILTIN_VOICE and produces 48 kHz stereo PCM.
+        the configured default voice and produces 48 kHz stereo PCM.
         """
         if g_facade is None:
             raise HTTPException(status_code=503, detail="TTS service not initialised")
@@ -197,7 +198,7 @@ def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastA
         return {
             "status": "healthy" if g_facade is not None else "not_ready",
             "model": MODEL_ID,
-            "voice": FIXED_BUILTIN_VOICE,
+            "voice": DEFAULT_VOICE_CONFIG.default_voice,
             "sample_rate": sample_rate,
             "channels": channels,
             "warmup_ready": g_warmup_ready,

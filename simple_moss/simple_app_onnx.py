@@ -8,7 +8,7 @@ from __future__ import annotations
 #   - 去掉 OnnxRequestRuntimeManager（用 api_facade.py 中的单实例锁替代）
 #   - 去掉非流式接口 synthesize
 #   - 去掉 _format_result_payload / _write_waveform_to_wav（result 不返回 WAV/base64）
-#   - synthesize_stream 固定走 FIXED_BUILTIN_VOICE，去掉 voice/prompt_audio_path 动态分支
+#   - synthesize_stream 默认走 _config.py 中的 voice，去掉 prompt_audio_path 动态分支
 #   - 新增 create_default_adapter / warmup_runtime 本地初始化入口
 # ============================================================
 
@@ -39,10 +39,6 @@ from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_req
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parent
-
-# 兼容导出：供尚未迁移到 _config.py 的外部模块引用。
-FIXED_BUILTIN_VOICE: str | None = DEFAULT_VOICE_CONFIG.default_voice
-
 
 class _CpuDeviceInfo:
     """设备描述占位符，将 device 字段统一表示为 "cpu" 字符串，供日志和元数据使用。"""
