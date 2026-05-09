@@ -118,6 +118,10 @@ def _render_index_html(base_url: str) -> str:
         <div style="margin-bottom: 12px;">
           <textarea id="text-input">{DEFAULT_TEXT}</textarea>
         </div>
+        <div style="margin-bottom: 12px;">
+          <label for="voice-input" class="meta">voice（可填 default 或内置音色名）</label>
+          <input id="voice-input" type="text" value="default" style="width: 100%; box-sizing: border-box;">
+        </div>
         <div class="meta" style="margin-top: 16px;">/health (TTS 前)</div>
         <div id="health-before" class="status-box">等待测试...</div>
 
@@ -141,6 +145,7 @@ def _render_index_html(base_url: str) -> str:
     const healthAfter = document.getElementById("health-after");
     
     const textInput = document.getElementById("text-input");
+    const voiceInput = document.getElementById("voice-input");
     const generateBtn = document.getElementById("generate-btn");
     const runStatus = document.getElementById("run-status");
     const audioOutput = document.getElementById("audio-output");
@@ -261,6 +266,7 @@ def _render_index_html(base_url: str) -> str:
       try {{
         const formData = new FormData();
         formData.set("text", textInput.value);
+        formData.set("voice", (voiceInput.value || "default").trim() || "default");
 
         const response = await fetch("/api/speech", {{
           method: "POST",
@@ -370,13 +376,14 @@ def build_app(base_url: str) -> FastAPI:
     @app.post("/api/speech")
     def post_speech(
         text: str = Form(...),
+        voice: str = Form("default"),
     ):
         """代理调用 /v1/audio/speech 接口，并将结果通过 StreamingResponse 逐块流式返回给前端"""
         url = urljoin(base_url, "/v1/audio/speech")
         payload = {
             "model": "moss-tts",
             "input": text,
-            "voice": "default",
+            "voice": str(voice or "default"),
             "response_format": "pcm",
             "speed": 1.0,
         }

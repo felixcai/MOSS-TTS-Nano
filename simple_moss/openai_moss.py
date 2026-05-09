@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ._config import DEFAULT_VOICE_CONFIG
+from ._voice_list import BUILTIN_VOICE_MAP
 from .api_facade import MossStreamApiFacade
 from .simple_app_onnx import create_default_adapter, warmup_runtime
 
@@ -37,8 +38,8 @@ log = logging.getLogger(__name__)
 
 # Fallback audio format — actual values are read from the ONNX model's
 # codec metadata at startup via adapter.runtime.get_codec_audio_format().
-SAMPLE_RATE: int = 48000
-CHANNELS: int = 2
+FALLBACK_SAMPLE_RATE: int = 48000
+FALLBACK_CHANNELS: int = 2
 MODEL_ID: str = "moss-tts"
 
 
@@ -59,7 +60,9 @@ class TTSVoice(BaseModel):
     """TTS voice definition."""
     id: str
     name: str
-    language: str = "Chinese"
+    language: str = "Unknown"
+    description: str = ""
+    gender: str = "Unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +80,65 @@ g_model_dir: Optional[str] = None
 # Streaming bridge: simple_moss sync queue → async generator
 # ---------------------------------------------------------------------------
 
-async def _stream_pcm(text: str) -> AsyncGenerator[bytes, None]:
+def _resolve_request_voice(requested_voice: str | None) -> str:
+    """Map OpenAI-style voice input to the actual simple_moss voice name."""
+    normalized_voice = str(requested_voice or "").strip()
+    if not normalized_voice or normalized_voice.lower() == "default":
+        return str(DEFAULT_VOICE_CONFIG.default_voice)
+    return normalized_voice
+
+
+def _resolve_voice_language(voice_name: str | None) -> str:
+    """Resolve voice language from the shared voice metadata table."""
+    normalized_voice = str(voice_name or "").strip()
+    if not normalized_voice:
+        return "Unknown"
+
+    voice_row = BUILTIN_VOICE_MAP.get(normalized_voice)
+    if not voice_row:
+        return "Unknown"
+
+    group_name = str(voice_row.get("group") or "").strip()
+    if not group_name:
+        return "Unknown"
+
+    return group_name.split()[0]
+
+
+def _resolve_voice_description(voice_name: str | None) -> str:
+    """Resolve voice description (display_name) from the shared voice metadata table."""
+    normalized_voice = str(voice_name or "").strip()
+    if not normalized_voice:
+        return ""
+
+    voice_row = BUILTIN_VOICE_MAP.get(normalized_voice)
+    if not voice_row:
+        return ""
+
+    return str(voice_row.get("display_name") or "").strip()
+
+
+def _resolve_voice_gender(voice_name: str | None) -> str:
+    """Resolve voice gender from the shared voice metadata table's group field."""
+    normalized_voice = str(voice_name or "").strip()
+    if not normalized_voice:
+        return "Unknown"
+
+    voice_row = BUILTIN_VOICE_MAP.get(normalized_voice)
+    if not voice_row:
+        return "Unknown"
+
+    group_name = str(voice_row.get("group") or "").strip()
+    if not group_name:
+        return "Unknown"
+
+    parts = group_name.split()
+    if len(parts) > 1:
+        return parts[1]
+    return "Unknown"
+
+
+async def _stream_pcm(text: str, voice: str | None) -> AsyncGenerator[bytes, None]:
     """Convert simple_moss blocking audio queue to an async byte generator.
 
     facade.audio() internally calls queue.Queue.get() which blocks the
@@ -87,9 +148,10 @@ async def _stream_pcm(text: str) -> AsyncGenerator[bytes, None]:
     if g_facade is None:
         raise RuntimeError("TTS facade not initialised")
 
-    start_resp = g_facade.start(text)
+    resolved_voice = _resolve_request_voice(voice)
+    start_resp = g_facade.start(text, voice=resolved_voice)
     stream_id = str(start_resp["stream_id"])
-    log.info("TTS stream started: stream_id=%s", stream_id)
+    log.info("TTS stream started: stream_id=%s voice=%s", stream_id, resolved_voice)
 
     try:
         loop = asyncio.get_event_loop()
@@ -118,7 +180,10 @@ async def _stream_pcm(text: str) -> AsyncGenerator[bytes, None]:
 # FastAPI application
 # ---------------------------------------------------------------------------
 
-def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastAPI:
+def build_app(
+    sample_rate: int = FALLBACK_SAMPLE_RATE,
+    channels: int = FALLBACK_CHANNELS,
+) -> FastAPI:
     """Create and return the FastAPI application with all routes registered."""
     app = FastAPI(
         title="MOSS TTS OpenAI-compatible API",
@@ -156,20 +221,45 @@ def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastA
     @app.get("/v1/audio/voices")
     async def list_voices():
         """List available voices."""
-        voice_name = str(DEFAULT_VOICE_CONFIG.default_voice or "default")
-        voices = [TTSVoice(id="default", name=voice_name, language="Chinese")]
+        voices: list[TTSVoice] = []
+        seen_voice_ids: set[str] = set()
+        default_voice = str(DEFAULT_VOICE_CONFIG.default_voice or "default")
+
+        def _append_voice(voice_id: str, voice_name: str) -> None:
+            if voice_id in seen_voice_ids:
+                return
+            seen_voice_ids.add(voice_id)
+            voices.append(
+                TTSVoice(
+                    id=voice_id,
+                    name=voice_name,
+                    language=_resolve_voice_language(voice_name),
+                    description=_resolve_voice_description(voice_name),
+                    gender=_resolve_voice_gender(voice_name),
+                )
+            )
+
+        _append_voice("default", default_voice)
+        if g_adapter is not None:
+            try:
+                for item in g_adapter.runtime.list_builtin_voices():
+                    builtin_voice = str(item.get("voice") or "").strip()
+                    if builtin_voice:
+                        _append_voice(builtin_voice, builtin_voice)
+            except Exception as exc:
+                log.warning("Could not list builtin voices from runtime: %s", exc)
         return {"voices": [v.model_dump() for v in voices]}
 
     @app.post("/v1/audio/speech")
     async def create_speech(request: TTSRequest):
         """Create speech from text — OpenAI-compatible streaming PCM endpoint.
 
-        Returns a streaming response of raw PCM s16le audio at SAMPLE_RATE Hz.
+        Returns a streaming response of raw PCM s16le audio at the configured sample rate.
         Response headers carry X-Sample-Rate and X-Channels for client decoding.
 
         Fields voice, response_format, and speed are accepted for API
-        compatibility but have no effect; the ONNX model always uses
-        the configured default voice and produces 48 kHz stereo PCM.
+        compatibility. voice selects the built-in voice used by simple_moss;
+        response_format and speed still have no effect.
         """
         if g_facade is None:
             raise HTTPException(status_code=503, detail="TTS service not initialised")
@@ -177,7 +267,7 @@ def build_app(sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> FastA
             raise HTTPException(status_code=400, detail="input text is required")
         try:
             return StreamingResponse(
-                _stream_pcm(request.input),
+                _stream_pcm(request.input, voice=request.voice),
                 media_type=f"audio/pcm;rate={sample_rate}",
                 headers={
                     "Content-Disposition": "attachment; filename=speech.pcm",
@@ -287,7 +377,7 @@ def main(argv: list[str] | None = None) -> None:
         _sr, _ch = g_adapter.runtime.get_codec_audio_format()
         log.info("Codec audio format from ONNX model: sample_rate=%d, channels=%d", _sr, _ch)
     except Exception as exc:
-        _sr, _ch = SAMPLE_RATE, CHANNELS
+        _sr, _ch = FALLBACK_SAMPLE_RATE, FALLBACK_CHANNELS
         log.warning(
             "Could not read codec audio format, using defaults (%d Hz / %d ch): %s",
             _sr, _ch, exc,
