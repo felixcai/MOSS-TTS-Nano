@@ -592,7 +592,7 @@ def build_app(state: WebRuntimeState) -> FastAPI:
         text: str = Form(...),
         max_new_frames: int = Form(375),
         voice_clone_max_text_tokens: int = Form(32),
-        chunk_pause_seconds: float = Form(2.0),
+        chunk_pause_seconds: float = Form(1.5),
     ):
         resolved_text = str(text or "").strip()
         if not resolved_text:
@@ -684,7 +684,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cpu-threads", type=int, default=1, help="ORT CPU 线程数")
     parser.add_argument("--max-new-frames", type=int, default=375, help="最大生成帧数")
     parser.add_argument("--voice-clone-max-text-tokens", type=int, default=32, help="每个文本 chunk 最大 token 数")
-    parser.add_argument("--chunk-pause-seconds", type=float, default=2.0, help="相邻 chunk 之间的静音时长基准（秒）")
+    parser.add_argument("--chunk-pause-seconds", type=float, default=1.5, help="相邻 chunk 之间的静音时长基准（秒）")
     parser.add_argument("--skip-warmup", action="store_true", help="跳过启动 warmup")
     return parser.parse_args(argv)
 

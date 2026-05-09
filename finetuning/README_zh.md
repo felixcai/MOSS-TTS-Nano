@@ -179,7 +179,6 @@ accelerate launch \
 
 - 使用 `accelerate launch --num_processes 1`，并设置 `--per-device-batch-size 1 --gradient-accumulation-steps 1 --max-length 1024 --mixed-precision bf16` 做实测，训练进程峰值显存稳定，约为 `3.23 GiB`。
 
-
 ### 4.5 输出 checkpoint
 
 每个 checkpoint 目录都可以直接被当前仓库的推理逻辑读取，里面会保存：
