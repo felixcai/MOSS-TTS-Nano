@@ -26,7 +26,7 @@ class VoiceConfig:
     generation fallback. Warmup uses WarmupConfig instead of this default voice.
     """
 
-    default_voice: str = "Lingyu"
+    default_voice: str = "Xiaoyu"
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class WarmupConfig:
     paths in the current warmup flow.
     """
 
-    warmup_voice_name: str = "Lingyu"
+    warmup_voice_name: str = "Xiaoyu"
     warmup_max_new_frames: int = 16
     warmup_text_sample_index: int = 0
 
