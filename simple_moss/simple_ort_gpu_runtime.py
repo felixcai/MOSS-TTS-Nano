@@ -44,6 +44,9 @@ MODEL_DIR_ALIAS_MAP = {
     "MOSS-Audio-Tokenizer-Nano-ONNX-CPU": "MOSS-Audio-Tokenizer-Nano-ONNX",
 }
 
+SHORT_FRAME_BUDGET_NUM = 6
+
+
 
 # -----------------------------------------------------------------------------
 # 模块级辅助函数
@@ -129,6 +132,7 @@ def _resolve_stream_decode_frame_budget(
     emitted_samples_total: int,
     sample_rate: int,
     first_audio_emitted_at_seconds: float | None,
+    short_frame_num: int = SHORT_FRAME_BUDGET_NUM,
 ) -> int:
     """根据当前流式超前量，动态决定本次 codec 解码应批处理多少帧。
     超前量不足时返回较小值（优先降低首帧延迟），超前量充足时返回较大值（提升吞吐）。
@@ -136,13 +140,9 @@ def _resolve_stream_decode_frame_budget(
     调用方：simple_app_onnx.py 中 synthesize_stream 内的 _decode_pending 闭包。
     """
     lead_seconds = _compute_stream_lead_seconds(emitted_samples_total, sample_rate, first_audio_emitted_at_seconds)
-    if not first_audio_emitted_at_seconds or lead_seconds < 0.20:
-        return 6
-    if lead_seconds < 0.55:
-        return 6
-    if lead_seconds < 1.10:
-        return 6
-    return 8
+    if not first_audio_emitted_at_seconds or lead_seconds < 1.10:
+        return short_frame_num
+    return int(short_frame_num * 1.5)
 
 
 # =============================================================================
