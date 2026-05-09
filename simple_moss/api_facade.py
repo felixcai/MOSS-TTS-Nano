@@ -584,9 +584,12 @@ class MossStreamApiFacade:
         调用方：test_local_api.py 的 run_test 函数（发起推理请求的入口）。
         """
         job = self._job_manager.create()
+        
+        normalized_text = self._stream_facade.adapter.normalize_text(text)
+        logging.info("经过文本正则化后的文本: %s", normalized_text)
 
         params = {
-            "text": text,
+            "text": normalized_text,
             "max_new_frames": max_new_frames if max_new_frames is not None else self._defaults["max_new_frames"],
             "voice_clone_max_text_tokens": voice_clone_max_text_tokens if voice_clone_max_text_tokens is not None else self._defaults["voice_clone_max_text_tokens"],
             "attn_implementation": attn_implementation if attn_implementation is not None else self._defaults["attn_implementation"],

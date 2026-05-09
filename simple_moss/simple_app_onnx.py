@@ -29,6 +29,7 @@ from .simple_onnx_tts_runtime import (
     _merge_audio_channels,
 )
 from .simple_ort_gpu_runtime import _resolve_stream_decode_frame_budget
+from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_request_texts
 
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parent
@@ -64,6 +65,7 @@ class OnnxNanoTTSServiceAdapter:
         output_dir: str | Path | None = None,
         cpu_threads: int = 4,
         max_new_frames: int = 375,
+        enable_wetext: bool = True,
     ) -> None:
         """创建 OnnxTtsRuntime 并初始化输出目录、设备元数据等属性。
 
@@ -91,7 +93,25 @@ class OnnxNanoTTSServiceAdapter:
         self.checkpoint_path = self.runtime.tts_meta_path.parent.resolve()
         self.audio_tokenizer_path = self.runtime.codec_meta_path.parent.resolve()
         self.thread_count = max(1, int(cpu_threads))
+        self.enable_wetext = enable_wetext
+        self.text_normalizer_manager = WeTextProcessingManager() if enable_wetext else None
+        if self.text_normalizer_manager:
+            self.text_normalizer_manager.start()
         _log_memory("runtime_init: OnnxNanoTTSServiceAdapter __init__ complete")
+
+    def normalize_text(self, text: str, voice: str | None = None) -> str:
+        """调用文本正则化管线。"""
+        if not self.enable_wetext:
+            return str(text or "")
+        effective_voice = FIXED_BUILTIN_VOICE if FIXED_BUILTIN_VOICE is not None else (voice or "")
+        prepared_texts = prepare_tts_request_texts(
+            text=str(text or ""),
+            voice=str(effective_voice or ""),
+            enable_wetext=self.enable_wetext,
+            enable_normalize_tts_text=True,
+            text_normalizer_manager=self.text_normalizer_manager,
+        )
+        return str(prepared_texts["text"])
 
     def warmup(self) -> dict[str, object]:
         """对底层 OnnxTtsRuntime 执行一次预热推理，降低首次真实请求延迟。
@@ -416,6 +436,7 @@ def create_default_adapter(
     output_dir: str | Path | None = None,
     cpu_threads: int = 1,
     max_new_frames: int = 375,
+    enable_wetext: bool = True,
 ) -> OnnxNanoTTSServiceAdapter:
     """创建并返回一个 OnnxNanoTTSServiceAdapter 实例，不启动 HTTP 服务器。
     这是 simple_moss 包的唯一初始化入口，供外部调用方（如 test_local_api.py）使用。
@@ -427,6 +448,7 @@ def create_default_adapter(
         output_dir=output_dir,
         cpu_threads=cpu_threads,
         max_new_frames=max_new_frames,
+        enable_wetext=enable_wetext,
     )
 
 
