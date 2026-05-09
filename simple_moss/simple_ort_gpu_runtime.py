@@ -28,6 +28,7 @@ from typing import Any, Callable
 import numpy as np
 import onnxruntime as ort
 
+from ._config import DEFAULT_STREAM_GENERATE_CONFIG
 from ._utils import _log_memory
 
 SAMPLE_MODE_GREEDY = "greedy"
@@ -43,8 +44,6 @@ MODEL_DIR_ALIAS_MAP = {
     "MOSS-TTS-Nano-ONNX-CPU": "MOSS-TTS-Nano-100M-ONNX",
     "MOSS-Audio-Tokenizer-Nano-ONNX-CPU": "MOSS-Audio-Tokenizer-Nano-ONNX",
 }
-
-SHORT_FRAME_BUDGET_NUM = 6
 
 
 
@@ -132,7 +131,7 @@ def _resolve_stream_decode_frame_budget(
     emitted_samples_total: int,
     sample_rate: int,
     first_audio_emitted_at_seconds: float | None,
-    short_frame_num: int = SHORT_FRAME_BUDGET_NUM,
+    short_frame_num: int = DEFAULT_STREAM_GENERATE_CONFIG.short_frame_num,
 ) -> int:
     """根据当前流式超前量，动态决定本次 codec 解码应批处理多少帧。
     超前量不足时返回较小值（优先降低首帧延迟），超前量充足时返回较大值（提升吞吐）。
@@ -363,24 +362,32 @@ class OrtCpuRuntime:
         """
         return list(self.manifest["text_samples"])
 
-    def warmup(self, *, voice_name: str | None = None) -> None:
+    def warmup(
+        self,
+        *,
+        voice_name: str,
+        text_sample_index: int,
+        max_new_frames: int,
+    ) -> None:
         """用内置音色 + 示例文本跑一次完整的 generate_audio_frames 和 codec 流式解码，
         触发 ONNX 图优化和 GPU Arena 预分配，降低首次真实请求的冷启动延迟。
 
         调用方：simple_app_onnx.py 中 OnnxNanoTTSServiceAdapter.warmup，
-                通过 self.runtime.warmup(voice_name=...) 调用。
+                通过 self.runtime.warmup(...) 调用。
         """
         _log_memory("warmup: OrtCpuRuntime.warmup start")
         voices = self.list_builtin_voices()
-        if voice_name is not None:
-            voice = next((v for v in voices if v["voice"] == voice_name), voices[0])
-        else:
-            voice = voices[0]
-        text_sample = self.list_text_samples()[0]
+        voice = next((v for v in voices if v["voice"] == voice_name), voices[0])
+        text_samples = self.list_text_samples()
+        resolved_text_sample_index = min(
+            max(0, int(text_sample_index)),
+            max(0, len(text_samples) - 1),
+        )
+        text_sample = text_samples[resolved_text_sample_index]
         request_rows = self.build_voice_clone_request_rows(voice["prompt_audio_codes"], text_sample["text_token_ids"])
 
         original_max_new_frames = self.manifest["generation_defaults"]["max_new_frames"]
-        self.manifest["generation_defaults"]["max_new_frames"] = 16
+        self.manifest["generation_defaults"]["max_new_frames"] = int(max_new_frames)
 
         try:
             _log_memory("warmup: before generate_audio_frames (prefill/decode)")

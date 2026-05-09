@@ -20,8 +20,6 @@ from typing import Any, Sequence
 import numpy as np
 import sentencepiece as spm
 
-from moss_tts_nano.defaults import DEFAULT_OUTPUT_DIR
-
 from ._utils import _log_memory
 from .simple_ort_gpu_runtime import (
     OrtCpuRuntime,
@@ -43,10 +41,6 @@ DEFAULT_BROWSER_ONNX_TTS_REPO_ID = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
 DEFAULT_BROWSER_ONNX_CODEC_REPO_ID = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX"
 DEFAULT_BROWSER_ONNX_TTS_REPO_URL = f"https://huggingface.co/{DEFAULT_BROWSER_ONNX_TTS_REPO_ID}"
 DEFAULT_BROWSER_ONNX_CODEC_REPO_URL = f"https://huggingface.co/{DEFAULT_BROWSER_ONNX_CODEC_REPO_ID}"
-# DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 0.40
-DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_SHORT_SECONDS = 1.50
-# DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 0.24
-DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS = 1.50
 SENTENCE_END_PUNCTUATION = set(".!?。！？；;")
 CLAUSE_SPLIT_PUNCTUATION = set(",，、；;：:")
 CLOSING_PUNCTUATION = set("\"'”’)]}）】》」』")
@@ -402,13 +396,13 @@ class OnnxTtsRuntime(OrtCpuRuntime):
 
     def __init__(
         self,
-        model_dir: str | Path | None = None,
+        model_dir: str | Path | None,
         *,
-        thread_count: int = 4,
-        max_new_frames: int | None = None,
+        thread_count: int,
+        max_new_frames: int | None,
         do_sample: bool | None = None,
         sample_mode: str | None = None,
-        output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+        output_dir: str | Path,
     ) -> None:
         """确认模型目录就绪，调用父类 OrtCpuRuntime.__init__ 加载 ONNX 模型，
         然后加载 SentencePiece tokenizer。
@@ -495,7 +489,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
             remaining_text = remaining_text[cut_index:].strip()
         return pieces
 
-    def split_voice_clone_text(self, text: str, max_tokens: int = 75) -> list[str]:
+    def split_voice_clone_text(self, text: str, max_tokens: int) -> list[str]:
         """将输入文本按句末标点 → 从句标点 → token budget 三级策略分割为若干 chunk，
         每个 chunk 的 token 数不超过 max_tokens。最终结果若只有一段则直接返回原文（不分割）。
 
@@ -554,7 +548,7 @@ class OnnxTtsRuntime(OrtCpuRuntime):
     def estimate_voice_clone_inter_chunk_pause_seconds(
         self,
         text_chunk: str,
-        chunk_pause_seconds: float = DEFAULT_VOICE_CLONE_INTER_CHUNK_PAUSE_LONG_SECONDS
+        chunk_pause_seconds: float,
     ) -> float:
         """根据当前 chunk 的长度估算下一个 chunk 前应插入的静音时长（秒）。
         短句（混合词数≤8）后插入较短静音 (chunk_pause_seconds / 2.0)，长句后插入配置的静音。

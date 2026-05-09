@@ -22,6 +22,7 @@ from typing import Iterator
 
 import numpy as np
 
+from ._config import DEFAULT_STREAM_GENERATE_CONFIG, DEFAULT_VOICE_CONFIG
 from .simple_app_onnx import OnnxNanoTTSServiceAdapter
 
 
@@ -304,6 +305,7 @@ def _run_streaming_job(
     stream_facade: "MossStreamFacade",
     *,
     text: str,
+    voice: str | None,
     max_new_frames: int,
     voice_clone_max_text_tokens: int,
     attn_implementation: str,
@@ -343,6 +345,7 @@ def _run_streaming_job(
 
         for event in stream_facade.stream_generate(
             text=text,
+            voice=voice,
             max_new_frames=int(max_new_frames),
             voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
             attn_implementation=attn_implementation,
@@ -524,19 +527,20 @@ class MossStreamApiFacade:
         self,
         adapter: OnnxNanoTTSServiceAdapter,
         *,
-        max_new_frames: int = 375,
-        voice_clone_max_text_tokens: int = 75,
-        attn_implementation: str = "model_default",
-        do_sample: bool = True,
-        text_temperature: float = 1.0,
-        text_top_p: float = 1.0,
-        text_top_k: int = 50,
-        audio_temperature: float = 0.8,
-        audio_top_p: float = 0.95,
-        audio_top_k: int = 25,
-        audio_repetition_penalty: float = 1.2,
-        seed: int | None = None,
-        chunk_pause_seconds: float = 2.0,
+        voice: str | None = DEFAULT_VOICE_CONFIG.default_voice,
+        max_new_frames: int = DEFAULT_STREAM_GENERATE_CONFIG.max_new_frames,
+        voice_clone_max_text_tokens: int = DEFAULT_STREAM_GENERATE_CONFIG.voice_clone_max_text_tokens,
+        attn_implementation: str = DEFAULT_STREAM_GENERATE_CONFIG.attn_implementation,
+        do_sample: bool = DEFAULT_STREAM_GENERATE_CONFIG.do_sample,
+        text_temperature: float = DEFAULT_STREAM_GENERATE_CONFIG.text_temperature,
+        text_top_p: float = DEFAULT_STREAM_GENERATE_CONFIG.text_top_p,
+        text_top_k: int = DEFAULT_STREAM_GENERATE_CONFIG.text_top_k,
+        audio_temperature: float = DEFAULT_STREAM_GENERATE_CONFIG.audio_temperature,
+        audio_top_p: float = DEFAULT_STREAM_GENERATE_CONFIG.audio_top_p,
+        audio_top_k: int = DEFAULT_STREAM_GENERATE_CONFIG.audio_top_k,
+        audio_repetition_penalty: float = DEFAULT_STREAM_GENERATE_CONFIG.audio_repetition_penalty,
+        seed: int | None = DEFAULT_STREAM_GENERATE_CONFIG.seed,
+        chunk_pause_seconds: float = DEFAULT_STREAM_GENERATE_CONFIG.chunk_pause_seconds,
     ) -> None:
         """创建 MossStreamFacade 和 StreamingJobManager，保存推理参数默认值。
 
@@ -545,6 +549,7 @@ class MossStreamApiFacade:
         self._stream_facade = MossStreamFacade(adapter)
         self._job_manager = StreamingJobManager()
         self._defaults = {
+            "voice": voice,
             "max_new_frames": max_new_frames,
             "voice_clone_max_text_tokens": voice_clone_max_text_tokens,
             "attn_implementation": attn_implementation,
@@ -564,6 +569,7 @@ class MossStreamApiFacade:
         self,
         text: str,
         *,
+        voice: str | None = None,
         max_new_frames: int | None = None,
         voice_clone_max_text_tokens: int | None = None,
         attn_implementation: str | None = None,
@@ -584,12 +590,14 @@ class MossStreamApiFacade:
         调用方：test_local_api.py 的 run_test 函数（发起推理请求的入口）。
         """
         job = self._job_manager.create()
-        
-        normalized_text = self._stream_facade.adapter.normalize_text(text)
+
+        resolved_voice = voice if voice is not None else self._defaults["voice"]
+        normalized_text = self._stream_facade.adapter.normalize_text(text, voice=resolved_voice)
         logging.info("经过文本正则化后的文本: %s", normalized_text)
 
         params = {
             "text": normalized_text,
+            "voice": resolved_voice,
             "max_new_frames": max_new_frames if max_new_frames is not None else self._defaults["max_new_frames"],
             "voice_clone_max_text_tokens": voice_clone_max_text_tokens if voice_clone_max_text_tokens is not None else self._defaults["voice_clone_max_text_tokens"],
             "attn_implementation": attn_implementation if attn_implementation is not None else self._defaults["attn_implementation"],

@@ -21,6 +21,12 @@ from typing import Iterator
 
 import numpy as np
 
+from ._config import (
+    DEFAULT_RUNTIME_INIT_CONFIG,
+    DEFAULT_STREAM_GENERATE_CONFIG,
+    DEFAULT_VOICE_CONFIG,
+    DEFAULT_WARMUP_CONFIG,
+)
 from ._utils import _log_memory
 from .simple_onnx_tts_runtime import (
     DEFAULT_BROWSER_ONNX_MODEL_DIR,
@@ -34,8 +40,8 @@ from text_normalization_pipeline import WeTextProcessingManager, prepare_tts_req
 APP_DIR = Path(__file__).resolve().parent
 REPO_ROOT = APP_DIR.parent
 
-# 固定使用的内置音色名称。
-FIXED_BUILTIN_VOICE: str | None = "Lingyu"
+# 兼容导出：供尚未迁移到 _config.py 的外部模块引用。
+FIXED_BUILTIN_VOICE: str | None = DEFAULT_VOICE_CONFIG.default_voice
 
 
 class _CpuDeviceInfo:
@@ -62,10 +68,10 @@ class OnnxNanoTTSServiceAdapter:
         self,
         *,
         model_dir: str | Path | None,
-        output_dir: str | Path | None = None,
-        cpu_threads: int = 4,
-        max_new_frames: int = 375,
-        enable_wetext: bool = True,
+        output_dir: str | Path | None,
+        cpu_threads: int,
+        max_new_frames: int,
+        enable_wetext: bool,
     ) -> None:
         """创建 OnnxTtsRuntime 并初始化输出目录、设备元数据等属性。
 
@@ -99,14 +105,13 @@ class OnnxNanoTTSServiceAdapter:
             self.text_normalizer_manager.start()
         _log_memory("runtime_init: OnnxNanoTTSServiceAdapter __init__ complete")
 
-    def normalize_text(self, text: str, voice: str | None = None) -> str:
+    def normalize_text(self, text: str, voice: str) -> str:
         """调用文本正则化管线。"""
         if not self.enable_wetext:
             return str(text or "")
-        effective_voice = FIXED_BUILTIN_VOICE if FIXED_BUILTIN_VOICE is not None else (voice or "")
         prepared_texts = prepare_tts_request_texts(
             text=str(text or ""),
-            voice=str(effective_voice or ""),
+            voice=str(voice or ""),
             enable_wetext=self.enable_wetext,
             enable_normalize_tts_text=True,
             text_normalizer_manager=self.text_normalizer_manager,
@@ -121,12 +126,16 @@ class OnnxNanoTTSServiceAdapter:
         """
         _log_memory("warmup: start")
         voice_name = (
-            FIXED_BUILTIN_VOICE
-            if FIXED_BUILTIN_VOICE is not None
+            DEFAULT_WARMUP_CONFIG.warmup_voice_name
+            if DEFAULT_WARMUP_CONFIG.warmup_voice_name
             else str(self.runtime.list_builtin_voices()[0]["voice"])
         )
         t0 = time.perf_counter()
-        self.runtime.warmup(voice_name=voice_name)
+        self.runtime.warmup(
+            voice_name=voice_name,
+            text_sample_index=DEFAULT_WARMUP_CONFIG.warmup_text_sample_index,
+            max_new_frames=DEFAULT_WARMUP_CONFIG.warmup_max_new_frames,
+        )
         t1 = time.perf_counter()
         _log_memory("warmup: complete (codec_decode_step session done)")
         return {
@@ -198,21 +207,21 @@ class OnnxNanoTTSServiceAdapter:
         mode: str = "voice_clone",
         voice: str | None = None,
         prompt_audio_path: str | None = None,
-        max_new_frames: int = 375,
-        voice_clone_max_text_tokens: int = 75,
+        max_new_frames: int,
+        voice_clone_max_text_tokens: int,
         tts_max_batch_size: int = 0,
         codec_max_batch_size: int = 0,
-        attn_implementation: str = "model_default",
-        do_sample: bool = True,
-        text_temperature: float = 1.0,
-        text_top_p: float = 1.0,
-        text_top_k: int = 50,
-        audio_temperature: float = 0.8,
-        audio_top_p: float = 0.95,
-        audio_top_k: int = 25,
-        audio_repetition_penalty: float = 1.2,
-        seed: int | None = None,
-        chunk_pause_seconds: float = 2.0,
+        attn_implementation: str,
+        do_sample: bool,
+        text_temperature: float,
+        text_top_p: float,
+        text_top_k: int,
+        audio_temperature: float,
+        audio_top_p: float,
+        audio_top_k: int,
+        audio_repetition_penalty: float,
+        seed: int | None,
+        chunk_pause_seconds: float,
     ) -> Iterator[dict[str, object]]:
         """在后台线程中启动流式 TTS 推理，通过 Generator 逐步 yield 音频事件和结果事件。
 
@@ -227,6 +236,7 @@ class OnnxNanoTTSServiceAdapter:
         主线程从 event_queue 消费事件并 yield，error 事件则抛出异常，None（sentinel）表示结束。
 
         调用方：api_facade.py 中 MossStreamFacade.stream_generate，在 execution_lock 保护下调用。
+        这条服务链路上的默认值由 facade 统一决定；本函数只接收上层显式传入的生成参数。
         """
         del mode, tts_max_batch_size, codec_max_batch_size
         event_queue: "queue.Queue[dict[str, object] | None]" = queue.Queue(maxsize=128)
@@ -247,7 +257,7 @@ class OnnxNanoTTSServiceAdapter:
 
         def _worker() -> None:
             """推理主循环：初始化参数 → 分句 → 逐 chunk 推理 → 发送 result 事件 → 放 sentinel。
-            固定使用 FIXED_BUILTIN_VOICE，忽略请求中的 voice / prompt_audio_path 参数。
+            默认使用配置中的默认音色，但允许请求中的 voice 显式覆盖；prompt_audio_path 仍忽略。
 
             调用方：本函数 synthesize_stream，通过 threading.Thread 在后台启动。
             """
@@ -268,8 +278,8 @@ class OnnxNanoTTSServiceAdapter:
                     seed=seed,
                 )
                 start_time = time.perf_counter()
-                # 固定使用 FIXED_BUILTIN_VOICE，忽略请求中的 voice / prompt_audio_path
-                effective_voice = FIXED_BUILTIN_VOICE if FIXED_BUILTIN_VOICE is not None else voice
+                # 优先使用单次请求传入的 voice，否则退回配置中的默认音色。
+                effective_voice = voice if voice is not None else DEFAULT_VOICE_CONFIG.default_voice
                 prompt_audio_codes = self.runtime.resolve_builtin_voice_prompt_audio_codes(effective_voice)
                 text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
                 sample_rate, channels = self.runtime.get_codec_audio_format()
@@ -432,11 +442,11 @@ class OnnxNanoTTSServiceAdapter:
 # ============================================================
 
 def create_default_adapter(
-    model_dir: str | Path | None = None,
-    output_dir: str | Path | None = None,
-    cpu_threads: int = 1,
-    max_new_frames: int = 375,
-    enable_wetext: bool = True,
+    model_dir: str | Path | None = DEFAULT_RUNTIME_INIT_CONFIG.model_dir,
+    output_dir: str | Path | None = DEFAULT_RUNTIME_INIT_CONFIG.output_dir,
+    cpu_threads: int = DEFAULT_RUNTIME_INIT_CONFIG.cpu_threads,
+    max_new_frames: int = DEFAULT_STREAM_GENERATE_CONFIG.max_new_frames,
+    enable_wetext: bool = DEFAULT_RUNTIME_INIT_CONFIG.enable_wetext,
 ) -> OnnxNanoTTSServiceAdapter:
     """创建并返回一个 OnnxNanoTTSServiceAdapter 实例，不启动 HTTP 服务器。
     这是 simple_moss 包的唯一初始化入口，供外部调用方（如 test_local_api.py）使用。
