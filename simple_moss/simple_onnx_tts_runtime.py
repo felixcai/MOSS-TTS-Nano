@@ -20,6 +20,7 @@ from typing import Any, Sequence
 import numpy as np
 import sentencepiece as spm
 
+from ._config import DEFAULT_VOICE_CONFIG
 from ._utils import _log_memory
 from .simple_ort_gpu_runtime import (
     OrtCpuRuntime,
@@ -582,15 +583,29 @@ class OnnxTtsRuntime(OrtCpuRuntime):
 
     def resolve_builtin_voice_prompt_audio_codes(self, voice: str | None) -> list[list[int]]:
         """根据音色名称在 manifest 中查找对应的 prompt_audio_codes（参考音频声学 token）。
-        voice 为 None 时回退到第一个内置音色，找不到则抛出 ValueError。
+        优先使用传入的 voice；找不到时回退到 _config.py 中的默认音色；
+        若默认音色也不存在，则最终回退到第一个内置音色。
 
         调用方：simple_app_onnx.py 的 _worker 闭包，通过 self.runtime.resolve_builtin_voice_prompt_audio_codes 调用；
                 本文件 resolve_prompt_audio_codes（间接委托）。
         """
-        resolved_voice = str(voice or self.list_builtin_voices()[0]["voice"])
-        voice_row = next((item for item in self.list_builtin_voices() if item["voice"] == resolved_voice), None)
+        voices = self.list_builtin_voices()
+        if not voices:
+            raise ValueError("No built-in voices available in manifest")
+
+        requested_voice = str(voice or "").strip()
+        default_voice = str(DEFAULT_VOICE_CONFIG.default_voice or "").strip()
+
+        voice_row = None
+        if requested_voice:
+            voice_row = next((item for item in voices if item["voice"] == requested_voice), None)
+
+        if voice_row is None and default_voice:
+            voice_row = next((item for item in voices if item["voice"] == default_voice), None)
+
         if voice_row is None:
-            raise ValueError(f"Built-in voice not found: {resolved_voice}")
+            voice_row = voices[0]
+
         return list(voice_row["prompt_audio_codes"])
 
     def get_codec_audio_format(self) -> tuple[int, int]:
