@@ -256,3 +256,50 @@
 
 - `sys_used` 是整机维度，可能混入其它线程/进程分配（例如服务启动并发初始化）。
 - warmup 的 `generate_audio_frames` 默认不传 `on_frame`，与 stream 的“边生成边 codec”时序不同；codec 往往在 warmup 末尾单独 `run_frames`。
+
+# Prefill, Stream Generate, Decode 等步骤全流程及 Prompt 解析
+
+在典型的基于大模型的 TTS（如 MOSS-TTS）中，音频生成的全流程可以分为以下几个核心阶段：
+
+## 1. 输入处理与编码 (Text Encoding & Prompt Build)
+
+- **动作**：输入待合成的文本（Text）和选定的音色参考音频（Prompt Audio）。将文本分块（Text Chunks），并对每个块提取参考音频对应的声学特征（Prompt Audio Codes）。
+- **作用**：准备好“让模型知道用什么声音、说什么话”的前置数据。
+
+## 2. Prefill (预填充阶段)
+
+- **动作**：将音色 Prompt 与当前待合成的文本 Token 拼接，一次性送入 `prefill` 模型计算。
+- **Prompt（输入）**：`[参考音频的声学 Tokens (Prompt Audio Codes)] + [当前待合成的文本 Tokens]`。
+  - **注意**：这里的“当前待合成的文本 Tokens”，是指**当前这一个 text chunk 的完整文本**。大模型 TTS 需要具备全局视野，它必须先“看全”这一整句话的内容，结合上文语气、标点符号等，才能在接下来的一步步生成中准确地把握语调、轻重音、停顿等韵律（Prosody）。如果文本是一点点喂给它，声音的情感和语调就会非常不连贯。
+- **作用**：让模型一次性理解上下文，计算出初始的全局隐藏状态（`global_hidden`）和 KV Cache（注意力缓存）。这是“消化上下文”最耗时但只需做一次的一步。
+
+## 3. 自回归 Decode 循环 (Stream Generate Token Decode)
+
+- **动作**：在 Prefill 得到的上下文基础上，开始一步步（Autoregressive）循环生成后续的声学 Token。
+- **Prompt（输入）**：**上一步刚刚生成的单个/单帧声学 Token**。模型基于累积的 KV Cache 和这个最新生成的 Token，预测下一帧。
+- **作用**：通过 `decode` 模型更新 `global_hidden` 并累积 KV Cache，再通过 `local_fixed_sampled_frame` 模型采样出具体的 Token，一帧一帧地生成音频离散表示。
+
+## 4. Codec 流式解码 (Codec Decode)
+
+- **动作**：前面生成的声学 Token 是一组离散的数字，无法直接发声。此阶段使用 `CodecStreamingDecodeSession.run_frames()` 将生成的声学 Token 送入 Codec 模型（声码器）。
+- **Prompt（输入）**：刚刚生成的 **声学 Token 序列/帧序列**。
+- **作用**：将声学特征解码成可供直接播放的 PCM 音频波形（audio tensor）。
+
+## 附：为什么每个 text chunk 都要 reset？
+
+流式 Codec（如 `CodecStreamingDecodeSession`）内部有状态（如卷积核缓冲、Transformer 的 KV Cache 等），目的是为了在**同一个句子**内将连续生成的音频片段平滑衔接，避免断音。
+当跨越 `text chunk`（通常是标点断句或段落边界）时：
+
+- 新的 chunk 往往是一个完全独立的新句子开头。
+- 如果保留上一个 chunk 的内部缓冲状态，旧句子的尾音信号会混入新句子的开头，产生不自然的混响或杂音（即“污染下一 chunk”）。
+- 因此，每个 chunk 开始前调用 `reset()` 清空 Codec 的内部状态，可以保证新句子从干净的“零状态”开始生成，有效防止音频上下文串扰。
+
+## 附：`CodecStreamingDecodeSession` 只管 Decode 吗？
+
+是的，`CodecStreamingDecodeSession` **只负责最后一步的 Codec 解码（声码器解码）**。
+文本处理和 Token 的循环生成（Prefill、Stream Generate、Decode 循环）是由底层的文本/声学模型（即 `sessions["prefill"]`、`sessions["decode"]` 等）负责。`CodecStreamingDecodeSession` 只接收已经生成好的“声学 Token 帧序列”，并纯粹将其转码为“PCM 音频波形”。
+
+## 打个比方，处理一个 chunk 时：
+
+- Prefill 阶段就像是你“一眼看完这一整句话并理解它的意思和该用什么语气”。
+- Stream Generate / Decode 阶段就像是你根据理解好的意思，“一个字一个字地把它读出声来”。
