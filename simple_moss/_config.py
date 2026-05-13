@@ -61,6 +61,7 @@ class StreamGenerateConfig:
     seed: int | None = None
     chunk_pause_seconds: float = 1.5
     short_frame_num: int = 6
+    prompt_tail_keep_frames: int = 150
     do_shrink_after_chunk: bool = True
 
 

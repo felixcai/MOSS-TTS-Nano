@@ -276,13 +276,15 @@ class OnnxNanoTTSServiceAdapter:
                 start_time = time.perf_counter()
                 # 优先使用单次请求传入的 voice，否则退回配置中的默认音色。
                 effective_voice = voice if voice is not None else DEFAULT_VOICE_CONFIG.default_voice
-                prompt_audio_codes = self.runtime.resolve_builtin_voice_prompt_audio_codes(effective_voice)
+                original_prompt_audio_codes = self.runtime.resolve_builtin_voice_prompt_audio_codes(effective_voice)
+                prompt_audio_codes = [list(code_row) for code_row in original_prompt_audio_codes]
                 text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
                 sample_rate, channels = self.runtime.get_codec_audio_format()
                 emitted_samples_total = 0
                 first_audio_emitted_at_perf: float | None = None
                 all_waveforms: list[np.ndarray] = []
                 audio_chunk_ranges: list[dict[str, object]] = []
+                prompt_tail_keep_frames = max(0, int(DEFAULT_STREAM_GENERATE_CONFIG.prompt_tail_keep_frames))
 
                 for chunk_index, chunk_text in enumerate(text_chunks):
                     if _stop_event.is_set():
@@ -363,8 +365,9 @@ class OnnxNanoTTSServiceAdapter:
                         pending_decode_frames.append(list(frame))
                         _decode_pending(False)
 
+                    generated_frames: list[list[int]] = []
                     try:
-                        self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
+                        generated_frames = self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
                         _decode_pending(True)
                     finally:
                         self.runtime.codec_streaming_session.reset()
@@ -379,6 +382,15 @@ class OnnxNanoTTSServiceAdapter:
                         "end_sample": chunk_audio_end_sample,
                     })
                     _log_memory(f"stream_worker: chunk {chunk_index} done")
+
+                    if generated_frames:
+                        tail_frames = generated_frames[-prompt_tail_keep_frames:] if prompt_tail_keep_frames > 0 else []
+                        prompt_audio_codes = [
+                            *[list(code_row) for code_row in original_prompt_audio_codes],
+                            *[list(frame) for frame in tail_frames],
+                        ]
+                    else:
+                        prompt_audio_codes = [list(code_row) for code_row in original_prompt_audio_codes]
 
                     if _stop_event.is_set():
                         break
