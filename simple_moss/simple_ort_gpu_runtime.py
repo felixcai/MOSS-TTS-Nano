@@ -560,72 +560,74 @@ class OrtCpuRuntime:
         previous_token_sets_by_channel = [set() for _ in range(int(self.manifest["tts_config"]["n_vq"]))]
         _last_decode_feeds: dict[str, np.ndarray] | None = None
 
-        for step_index in range(int(generation_defaults["max_new_frames"])):
-            frame: list[int] = []
-            if step_index == 0:
-                _trace_memory("decode loop first frame start")
-
-            # 路径 B：local_fixed_sampled_frame（整帧一次推理，fixed 采样模式）
-            if "local_fixed_sampled_frame" in self.sessions and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED:
+        try:
+            for step_index in range(int(generation_defaults["max_new_frames"])):
+                frame: list[int] = []
                 if step_index == 0:
-                    _trace_memory("before first local_fixed_sampled_frame.run")
-                should_continue, frame = self.run_local_fixed_sampled_frame(
-                    global_hidden,
-                    previous_token_sets_by_channel=previous_token_sets_by_channel,
-                )
-                if step_index == 0:
-                    _trace_memory("after first local_fixed_sampled_frame.run")
-                if not should_continue:
+                    _trace_memory("decode loop first frame start")
+    
+                # 路径 B：local_fixed_sampled_frame（整帧一次推理，fixed 采样模式）
+                if "local_fixed_sampled_frame" in self.sessions and generation_defaults["sample_mode"] == SAMPLE_MODE_FIXED:
+                    if step_index == 0:
+                        _trace_memory("before first local_fixed_sampled_frame.run")
+                    should_continue, frame = self.run_local_fixed_sampled_frame(
+                        global_hidden,
+                        previous_token_sets_by_channel=previous_token_sets_by_channel,
+                    )
+                    if step_index == 0:
+                        _trace_memory("after first local_fixed_sampled_frame.run")
+                    if not should_continue:
+                        break
+                    for channel_index, sampled_token in enumerate(frame):
+                        previous_tokens_by_channel[channel_index].append(sampled_token)
+                        previous_token_sets_by_channel[channel_index].add(sampled_token)
+                else:
+                    logging.warning("simple_ort_gpu_runtime: local_fixed_sampled_frame session not available or sample_mode != fixed, skipping frame")
                     break
-                for channel_index, sampled_token in enumerate(frame):
-                    previous_tokens_by_channel[channel_index].append(sampled_token)
-                    previous_token_sets_by_channel[channel_index].add(sampled_token)
-            else:
-                logging.warning("simple_ort_gpu_runtime: local_fixed_sampled_frame session not available or sample_mode != fixed, skipping frame")
-                break
+    
+                generated_frames.append(frame)
+    
+                # ── 每帧后：运行 decode ONNX 更新 global_hidden 和 KV Cache ────────
+                next_row = np.full((1, 1, row_width), int(self.manifest["tts_config"]["audio_pad_token_id"]), dtype=np.int32)
+                next_row[0, 0, 0] = int(self.manifest["tts_config"]["audio_assistant_slot_token_id"])
+                for index, token in enumerate(frame):
+                    next_row[0, 0, index + 1] = int(token)
+                decode_feeds: dict[str, np.ndarray] = {
+                    "input_ids": next_row,
+                    "past_valid_lengths": np.asarray([past_valid_length], dtype=np.int32),
+                }
+                for input_name in self.tts_meta["onnx"]["decode_input_names"][2:]:
+                    decode_feeds[input_name] = past_by_name[input_name]
+                _last_decode_feeds = decode_feeds
+                if step_index == 0:
+                    _trace_memory("before first decode.run")
+                decode_outputs = self.sessions["decode"].run(None, decode_feeds)
+                if step_index == 0:
+                    _trace_memory("after first decode.run")
+                decode_output_names = [output.name for output in self.sessions["decode"].get_outputs()]
+                named_decode_outputs = dict(zip(decode_output_names, decode_outputs, strict=True))
+                global_hidden = _extract_last_hidden(named_decode_outputs["global_hidden"])
+                past_valid_length += 1
+                past_by_name = {
+                    output_name.replace("present_", "past_"): named_decode_outputs[output_name]
+                    for output_name in self.tts_meta["onnx"]["decode_output_names"][1:]
+                }
+    
+                # ── 触发 on_frame 回调 ────────────────────────────────────────────
+                if on_frame is not None:
+                    on_frame(generated_frames, step_index, frame)
+        finally:
+            # ── 生成结束：执行一次带 Shrinkage 的收缩空跑 ─────────────────────────
+            _trace_memory(f"decode loop done, generated_frames={len(generated_frames)}")
+            if DEFAULT_STREAM_GENERATE_CONFIG.do_shrink_after_chunk and _last_decode_feeds is not None:
+                _shrink_run_options = ort.RunOptions()
+                _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+                _trace_memory("before decode arena shrinkage run")
+                self.sessions["decode"].run(None, _last_decode_feeds, run_options=_shrink_run_options)
+                _trace_memory("after decode arena shrinkage run")
+    
+            _trace_memory("return")
 
-            generated_frames.append(frame)
-
-            # ── 每帧后：运行 decode ONNX 更新 global_hidden 和 KV Cache ────────
-            next_row = np.full((1, 1, row_width), int(self.manifest["tts_config"]["audio_pad_token_id"]), dtype=np.int32)
-            next_row[0, 0, 0] = int(self.manifest["tts_config"]["audio_assistant_slot_token_id"])
-            for index, token in enumerate(frame):
-                next_row[0, 0, index + 1] = int(token)
-            decode_feeds: dict[str, np.ndarray] = {
-                "input_ids": next_row,
-                "past_valid_lengths": np.asarray([past_valid_length], dtype=np.int32),
-            }
-            for input_name in self.tts_meta["onnx"]["decode_input_names"][2:]:
-                decode_feeds[input_name] = past_by_name[input_name]
-            _last_decode_feeds = decode_feeds
-            if step_index == 0:
-                _trace_memory("before first decode.run")
-            decode_outputs = self.sessions["decode"].run(None, decode_feeds)
-            if step_index == 0:
-                _trace_memory("after first decode.run")
-            decode_output_names = [output.name for output in self.sessions["decode"].get_outputs()]
-            named_decode_outputs = dict(zip(decode_output_names, decode_outputs, strict=True))
-            global_hidden = _extract_last_hidden(named_decode_outputs["global_hidden"])
-            past_valid_length += 1
-            past_by_name = {
-                output_name.replace("present_", "past_"): named_decode_outputs[output_name]
-                for output_name in self.tts_meta["onnx"]["decode_output_names"][1:]
-            }
-
-            # ── 触发 on_frame 回调 ────────────────────────────────────────────
-            if on_frame is not None:
-                on_frame(generated_frames, step_index, frame)
-
-        # ── 生成结束：执行一次带 Shrinkage 的收缩空跑 ─────────────────────────
-        _trace_memory(f"decode loop done, generated_frames={len(generated_frames)}")
-        if _last_decode_feeds is not None:
-            _shrink_run_options = ort.RunOptions()
-            _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
-            _trace_memory("before decode arena shrinkage run")
-            self.sessions["decode"].run(None, _last_decode_feeds, run_options=_shrink_run_options)
-            _trace_memory("after decode arena shrinkage run")
-
-        _trace_memory("return")
         return generated_frames
 
 
