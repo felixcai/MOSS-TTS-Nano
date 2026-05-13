@@ -153,6 +153,7 @@ class StreamingJob:
     audio_queue: "queue.Queue[bytes | None]" = field(default_factory=lambda: queue.Queue(maxsize=64))
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
+    first_frame_latency_seconds: float | None = None
     first_audio_at: float | None = None
     completed_at: float | None = None
     state: str = "starting"
@@ -203,6 +204,7 @@ class StreamingJob:
                 "current_chunk_index": self.current_chunk_index,
                 "playback_chunk_index": self._resolve_playback_chunk_index_locked(),
                 "text_chunks": list(self.text_chunks),
+                "first_frame_latency_seconds": self.first_frame_latency_seconds,
                 "first_audio_latency_seconds": (
                     None
                     if self.started_at is None or self.first_audio_at is None
@@ -426,8 +428,14 @@ def _run_streaming_job(
                     sample_rate = int(event.get("sample_rate") or 48000)
                     channels = int(event.get("channels") or 2)
                     emitted_audio_seconds = float(event.get("emitted_audio_seconds") or 0.0)
+                    first_frame_latency_s = event.get("first_frame_latency_s")
                     with job.lock:
                         job.text_chunks = text_chunks
+                        job.first_frame_latency_seconds = (
+                            float(first_frame_latency_s)
+                            if first_frame_latency_s is not None
+                            else None
+                        )
                         job.final_result = {
                             "run_status": formatted_run_status,
                             "text_chunks": text_chunks,
@@ -435,6 +443,7 @@ def _run_streaming_job(
                             "sample_rate": sample_rate,
                             "channels": channels,
                             "emitted_audio_seconds": emitted_audio_seconds,
+                            "first_frame_latency_seconds": job.first_frame_latency_seconds,
                         }
                         job.state = "done"
                         job.completed_at = time.monotonic()
@@ -461,10 +470,15 @@ def _run_streaming_job(
                         )
                     logging.info(
                         "Nano-TTS stream RTF | stream_id=%s | audio_chunks=%d | total_audio_s=%.3f | "
-                        "first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
+                        "ttfa_s=%s | first_audio_latency_s=%s | rtf_first=%s | rtf_steady=%s",
                         job.stream_id,
                         rtf_audio_chunk_count,
                         total_audio_s,
+                        (
+                            f"{job.first_frame_latency_seconds:.4f}"
+                            if job.first_frame_latency_seconds is not None
+                            else "n/a"
+                        ),
                         f"{first_audio_latency_s:.4f}" if first_audio_latency_s is not None else "n/a",
                         f"{rtf_first:.4f}" if rtf_first is not None else "n/a",
                         f"{rtf_steady:.4f}" if rtf_steady is not None else "n/a",

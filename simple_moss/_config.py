@@ -58,10 +58,10 @@ class StreamGenerateConfig:
     audio_top_p: float = 0.95  # Not confirmed effective in current simple_moss path.
     audio_top_k: int = 25  # Not confirmed effective in current simple_moss path.
     audio_repetition_penalty: float = 1.2  # Not confirmed effective in current simple_moss path.
-    seed: int | None = None
+    seed: int | None = 123
     chunk_pause_seconds: float = 1.5
     short_frame_num: int = 6
-    prompt_tail_keep_frames: int = 150
+    prompt_tail_keep_frames: int = 60
     do_shrink_after_chunk: bool = True
 
 

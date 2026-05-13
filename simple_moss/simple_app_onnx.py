@@ -281,6 +281,7 @@ class OnnxNanoTTSServiceAdapter:
                 text_chunks = self.runtime.split_voice_clone_text(str(text or ""), max_tokens=int(voice_clone_max_text_tokens))
                 sample_rate, channels = self.runtime.get_codec_audio_format()
                 emitted_samples_total = 0
+                first_frame_generated_at_perf: float | None = None
                 first_audio_emitted_at_perf: float | None = None
                 all_waveforms: list[np.ndarray] = []
                 audio_chunk_ranges: list[dict[str, object]] = []
@@ -362,6 +363,9 @@ class OnnxNanoTTSServiceAdapter:
                         调用方：simple_ort_gpu_runtime.py 中 generate_audio_frames 的 decode 循环，
                                 通过 on_frame 参数传入并在每步末尾调用。
                         """
+                        nonlocal first_frame_generated_at_perf
+                        if first_frame_generated_at_perf is None:
+                            first_frame_generated_at_perf = time.perf_counter()
                         pending_decode_frames.append(list(frame))
                         _decode_pending(False)
 
@@ -408,6 +412,11 @@ class OnnxNanoTTSServiceAdapter:
 
                 if not _stop_event.is_set():
                     elapsed_seconds = time.perf_counter() - start_time
+                    first_frame_latency_s = (
+                        max(0.0, first_frame_generated_at_perf - start_time)
+                        if first_frame_generated_at_perf is not None
+                        else None
+                    )
                     _safe_put(
                         {
                             "type": "result",
@@ -417,6 +426,7 @@ class OnnxNanoTTSServiceAdapter:
                             "sample_rate": sample_rate,
                             "channels": channels,
                             "emitted_audio_seconds": emitted_samples_total / float(sample_rate),
+                            "first_frame_latency_s": first_frame_latency_s,
                             "elapsed_seconds": elapsed_seconds,
                         }
                     )
