@@ -20,10 +20,11 @@ class RuntimeInitConfig:
 
 @dataclass(frozen=True)
 class VoiceConfig:
-    """Default service-level voice used for text normalization and stream generation.
+    """Default service-level voice used for text normalization, stream generation, and warmup.
 
     Current simple_moss status: confirmed effective for normalization and stream
-    generation fallback. Warmup uses WarmupConfig instead of this default voice.
+    generation fallback. Warmup also reads this default voice before applying
+    its own builtin-voice fallback.
     """
 
     default_voice: str = "Xiaoyu"
@@ -71,7 +72,6 @@ class WarmupConfig:
     paths in the current warmup flow.
     """
 
-    warmup_voice_name: str = "Xiaoyu"
     warmup_max_new_frames: int = 16
     warmup_text_sample_index: int = 0
 

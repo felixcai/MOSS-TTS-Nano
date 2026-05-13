@@ -122,8 +122,8 @@ class OnnxNanoTTSServiceAdapter:
         """
         _log_memory("warmup: start")
         voice_name = (
-            DEFAULT_WARMUP_CONFIG.warmup_voice_name
-            if DEFAULT_WARMUP_CONFIG.warmup_voice_name
+            DEFAULT_VOICE_CONFIG.default_voice
+            if DEFAULT_VOICE_CONFIG.default_voice
             else str(self.runtime.list_builtin_voices()[0]["voice"])
         )
         t0 = time.perf_counter()
