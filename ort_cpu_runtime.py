@@ -460,7 +460,7 @@ class OrtCpuRuntime:
         options.enable_cpu_mem_arena = False
 
         # return ort.InferenceSession(str(path_value), sess_options=options, providers=["CPUExecutionProvider"])
-        return ort.InferenceSession(str(path_value), sess_options=options, providers=["CUDAExecutionProvider"])
+        return ort.InferenceSession(str(path_value), sess_options=options, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 
     # [调用链内部] 被 __init__ 调用，按 tts_meta / codec_meta 中的文件路径加载所有 ONNX 模型
     # 可选 session（local_greedy_frame / local_fixed_sampled_frame / local_cached_step）按 manifest 条件加载
@@ -481,8 +481,8 @@ class OrtCpuRuntime:
         # if self.tts_meta["files"].get("local_cached_step"):
         #     sessions["local_cached_step"] = self._session(tts_dir / self.tts_meta["files"]["local_cached_step"])
         _log_memory("runtime_init: _create_sessions TTS part done (prefill/decode/local_*)")
-        # sessions["codec_encode"] = self._session(codec_dir / self.codec_meta["files"]["encode"])
-        # sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
+        sessions["codec_encode"] = self._session(codec_dir / self.codec_meta["files"]["encode"])
+        sessions["codec_decode"] = self._session(codec_dir / self.codec_meta["files"]["decode_full"])
         sessions["codec_decode_step"] = self._session(codec_dir / self.codec_meta["files"]["decode_step"])
         _log_memory("runtime_init: _create_sessions codec part done (encode/decode_full/decode_step)")
         return sessions
@@ -1051,11 +1051,14 @@ class OrtCpuRuntime:
         # 而不是在每帧后都触发（会严重拖慢推理速度）。
         _trace_memory(f"decode loop done, generated_frames={len(generated_frames)}")
         if _last_decode_feeds is not None:
-            _shrink_run_options = ort.RunOptions()
-            _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
-            _trace_memory("before decode arena shrinkage run")
-            self.sessions["decode"].run(None, _last_decode_feeds, run_options=_shrink_run_options)
-            _trace_memory("after decode arena shrinkage run")
+            decode_session = self.sessions["decode"]
+            active_provider = (decode_session.get_providers() or [""])[0]
+            if active_provider == "CUDAExecutionProvider":
+                _shrink_run_options = ort.RunOptions()
+                _shrink_run_options.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+                _trace_memory("before decode arena shrinkage run")
+                decode_session.run(None, _last_decode_feeds, run_options=_shrink_run_options)
+                _trace_memory("after decode arena shrinkage run")
 
         _trace_memory("return")
         return generated_frames
