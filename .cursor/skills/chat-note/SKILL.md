@@ -21,26 +21,25 @@ Use this skill when the user asks to:
 ## Workflow
 
 1. Identify the requested start point.
-   - If the user says “从上面这个对话开始”, start from the referenced message.
+   
+   - If the user says “从某一个对话开始”, start from the referenced message.
    - If the start point is ambiguous, ask a short clarification before editing.
 
 2. Identify the target markdown file.
+   
    - If the user provides a file path, use that file.
    - Read the file first if it already exists.
    - Preserve existing content unless the user explicitly asks to rewrite it.
 
 3. Summarize only the relevant chat content.
-   - Keep conclusions, decisions, definitions, open questions, and implementation rules.
-   - Remove repeated back-and-forth, acknowledgements, and low-value phrasing.
+   
+   - Keep complete agent chat content. Only remove repeated back-and-forth.
    - Prefer concise engineering notes over transcript-style logs.
 
 4. Organize chapters using the required rules:
+   
    - If a topic or question is relatively independent, create a new H1 chapter.
    - If it supplements a previous topic or question, add it under that topic with a heading level one deeper than the parent heading.
-
-5. Append or update the markdown file.
-   - If the user says “追加”, append to the end.
-   - If a matching chapter already exists and the new content is clearly a supplement, update that chapter instead of duplicating it.
 
 ## Section Rules
 
@@ -72,7 +71,7 @@ Do not create excessive heading levels. Prefer the shallowest level that accurat
 - Keep notes actionable and specific.
 - Use code fences for call chains, data structures, API shapes, and command examples.
 - Use inline code for file paths, symbols, fields, and endpoint names.
-- Avoid turning the note into a full transcript.
+- 
 
 ## Validation
 
